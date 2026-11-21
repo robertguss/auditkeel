@@ -1,0 +1,35 @@
+[package]
+name = "auditkeel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Blazing-fast, agent-first (DX + AX) Rust Proof-Carrying SQL Analysis Auditor for PostgreSQL: CTE waterfalls, join fan-out & coverage checks, grain verification, live query diffs, and offline HTML audit receipts."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/robertguss/auditkeel"
+homepage = "https://github.com/robertguss/auditkeel"
+keywords = ["sql", "postgres", "audit", "analytics", "data-quality"]
+categories = ["command-line-utilities", "development-tools", "database"]
+
+[features]
+default = []
+# Statically vendor OpenSSL on Linux for portable manylinux wheels / release binaries.
+vendored-tls = ["native-tls/vendored"]
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+indexmap = { version = "2.14", features = ["serde"] }
+native-tls = "0.2"
+owo-colors = { version = "4.4", features = ["supports-colors"] }
+postgres = { version = "0.19", features = ["with-chrono-0_4", "with-serde_json-1"] }
+postgres-native-tls = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sqlparser = "0.64"
+thiserror = "2.0"
+
+[dev-dependencies]
+assert_cmd = "2.2"
+predicates = "3.1"
+tempfile = "3.27"

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1.10,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "auditkeel"
+dynamic = ["version"]
+description = "Proof-carrying Rust SQL Analysis Auditor for PostgreSQL (CTE waterfalls, join fan-out & coverage, grain checks, live SQL diff, and HTML receipts)."
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Robert Guss" }]
+requires-python = ">=3.9"
+keywords = ["sql", "postgres", "analytics", "audit", "data-quality", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+]
+
+[project.urls]
+Homepage = "https://github.com/robertguss/auditkeel"
+Repository = "https://github.com/robertguss/auditkeel"
+Issues = "https://github.com/robertguss/auditkeel/issues"
+
+[tool.maturin]
+bindings = "bin"
+features = ["vendored-tls"]
+compatibility = "pypi"
+strip = true
