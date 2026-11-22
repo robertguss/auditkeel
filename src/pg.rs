@@ -79,6 +79,7 @@ fn is_loopback_config(cfg: &Config) -> bool {
         return true;
     }
     hosts.iter().all(|h| match h {
+        #[cfg(unix)]
         Host::Unix(_) => true,
         Host::Tcp(addr) => {
             let low = addr.to_lowercase();
