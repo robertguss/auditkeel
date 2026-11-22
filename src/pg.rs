@@ -1,38 +1,128 @@
-//! Read-only PostgreSQL execution engine for CTE waterfalls, join probes, grain & diffs.
+//! Read-only PostgreSQL execution engine for CTE waterfalls, composite join probes, grain & diffs.
 
 use std::collections::HashSet;
-use std::time::Instant;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use native_tls::TlsConnector;
-use postgres::{Client, NoTls, Transaction};
+use postgres::config::{Host, SslMode};
+use postgres::{Client, Config, NoTls, Transaction};
 use postgres_native_tls::MakeTlsConnector;
 
 use crate::model::{
     AuditReport, CteStep, DiffReport, Finding, GrainAudit, JoinProbe, KeyOverlapDiff,
     NumericColDiff, Severity, SpotCheckTrace, compute_status, sha256_hex,
 };
-use crate::parse::{ParsedJoin, ParsedQuery};
+use crate::parse::{self, ParsedJoin, ParsedQuery};
 
-pub fn connect_postgres(dsn: &str) -> Result<Client, String> {
-    let lower = dsn.to_lowercase();
-    let disable_tls = lower.contains("sslmode=disable")
-        || lower.contains("127.0.0.1")
-        || lower.contains("localhost");
-    if disable_tls {
-        Client::connect(dsn, NoTls).map_err(|e| format!("PostgreSQL connection failed: {e}"))
-    } else {
-        let connector = TlsConnector::builder()
-            .build()
-            .map_err(|e| format!("TLS initialization failed: {e}"))?;
-        let tls = MakeTlsConnector::new(connector);
-        match Client::connect(dsn, tls) {
-            Ok(c) => Ok(c),
-            Err(tls_err) => Client::connect(dsn, NoTls).map_err(|plain_err| {
-                format!("PostgreSQL connection failed (TLS: {tls_err}; NoTls: {plain_err})")
-            }),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestedSsl {
+    Disable,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+fn scrub_dsn_error(msg: String) -> String {
+    // Redact any `://user:password@` credential fragment if echoed in an error
+    if let Some(scheme_end) = msg.find("://") {
+        let rest = &msg[scheme_end + 3..];
+        if let Some(at_pos) = rest.find('@')
+            && rest[..at_pos].contains(':')
+        {
+            return format!("{}://***@{}", &msg[..scheme_end], &rest[at_pos + 1..]);
         }
     }
+    msg
+}
+
+fn normalize_dsn_sslmode(dsn: &str) -> (String, RequestedSsl) {
+    let lower = dsn.to_lowercase();
+    if lower.contains("sslmode=verify-full") {
+        let rewritten = dsn
+            .replace("sslmode=verify-full", "sslmode=require")
+            .replace("SSLMODE=VERIFY-FULL", "sslmode=require");
+        (rewritten, RequestedSsl::VerifyFull)
+    } else if lower.contains("sslmode=verify-ca") {
+        let rewritten = dsn
+            .replace("sslmode=verify-ca", "sslmode=require")
+            .replace("SSLMODE=VERIFY-CA", "sslmode=require");
+        (rewritten, RequestedSsl::VerifyCa)
+    } else if lower.contains("sslmode=disable") {
+        (dsn.to_string(), RequestedSsl::Disable)
+    } else if lower.contains("sslmode=require") {
+        (dsn.to_string(), RequestedSsl::Require)
+    } else {
+        (dsn.to_string(), RequestedSsl::Prefer)
+    }
+}
+
+fn is_loopback_config(cfg: &Config) -> bool {
+    let hosts = cfg.get_hosts();
+    if hosts.is_empty() {
+        return true;
+    }
+    hosts.iter().all(|h| match h {
+        Host::Unix(_) => true,
+        Host::Tcp(addr) => {
+            let low = addr.to_lowercase();
+            low == "localhost" || low == "127.0.0.1" || low == "::1"
+        }
+    })
+}
+
+pub fn connect_postgres(dsn: &str) -> Result<Client, String> {
+    let (norm_dsn, req_ssl) = normalize_dsn_sslmode(dsn);
+    let mut cfg = Config::from_str(&norm_dsn)
+        .map_err(|e| scrub_dsn_error(format!("invalid PostgreSQL DSN: {e}")))?;
+    if cfg.get_connect_timeout().is_none() {
+        cfg.connect_timeout(Duration::from_secs(10));
+    }
+
+    let loopback = is_loopback_config(&cfg);
+    match req_ssl {
+        RequestedSsl::Disable => cfg
+            .connect(NoTls)
+            .map_err(|e| scrub_dsn_error(format!("PostgreSQL connection failed: {e}"))),
+        RequestedSsl::Prefer if loopback => {
+            cfg.ssl_mode(SslMode::Disable);
+            cfg.connect(NoTls)
+                .map_err(|e| scrub_dsn_error(format!("PostgreSQL local connection failed: {e}")))
+        }
+        RequestedSsl::Prefer | RequestedSsl::Require | RequestedSsl::VerifyFull => {
+            // Remote host or required TLS: enforce TLS with full certificate & hostname verification.
+            // Never silently downgrade a remote connection to plaintext NoTls!
+            cfg.ssl_mode(SslMode::Require);
+            let connector = TlsConnector::builder()
+                .build()
+                .map_err(|e| format!("TLS initialization failed: {e}"))?;
+            let tls = MakeTlsConnector::new(connector);
+            cfg.connect(tls)
+                .map_err(|e| scrub_dsn_error(format!("PostgreSQL TLS connection failed: {e}")))
+        }
+        RequestedSsl::VerifyCa => {
+            cfg.ssl_mode(SslMode::Require);
+            let connector = TlsConnector::builder()
+                .danger_accept_invalid_hostnames(true)
+                .build()
+                .map_err(|e| format!("TLS initialization failed: {e}"))?;
+            let tls = MakeTlsConnector::new(connector);
+            cfg.connect(tls)
+                .map_err(|e| scrub_dsn_error(format!("PostgreSQL TLS (verify-ca) connection failed: {e}")))
+        }
+    }
+}
+
+fn configure_readonly_session(tx: &mut Transaction<'_>) -> Result<(), String> {
+    tx.execute("SET LOCAL TimeZone = 'UTC'", &[])
+        .map_err(|e| format!("failed setting UTC timezone: {e}"))?;
+    tx.execute("SET LOCAL lock_timeout = '5s'", &[])
+        .map_err(|e| format!("failed setting lock_timeout: {e}"))?;
+    tx.execute("SET LOCAL statement_timeout = '120s'", &[])
+        .map_err(|e| format!("failed setting statement_timeout: {e}"))?;
+    Ok(())
 }
 
 fn quote_ident(ident: &str) -> String {
@@ -45,11 +135,21 @@ fn build_cte_prefix(parsed: &ParsedQuery, up_to_exclusive: usize) -> String {
     }
     let defs: Vec<String> = parsed.ctes[..up_to_exclusive]
         .iter()
-        .map(|c| format!("{} AS ({})", quote_ident(&c.name), c.query_sql))
+        .map(|c| {
+            let cols = if c.alias_columns.is_empty() {
+                String::new()
+            } else {
+                let qcols: Vec<String> = c.alias_columns.iter().map(|col| quote_ident(col)).collect();
+                format!("({})", qcols.join(", "))
+            };
+            format!("{}{cols} AS (\n{}\n)", quote_ident(&c.name), c.query_sql)
+        })
         .collect();
-    format!("WITH {} ", defs.join(", "))
+    let rec = if parsed.with_recursive { "RECURSIVE " } else { "" };
+    format!("WITH {rec}{}\n", defs.join(",\n"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_live_audit(
     dsn: &str,
     source: &str,
@@ -58,6 +158,7 @@ pub fn run_live_audit(
     keys: &[String],
     spot_checks: usize,
     max_fanout: f64,
+    min_rows: Option<i64>,
 ) -> Result<AuditReport, String> {
     let mut client = connect_postgres(dsn)?;
     let mut tx = client
@@ -65,12 +166,12 @@ pub fn run_live_audit(
         .read_only(true)
         .start()
         .map_err(|e| format!("failed to start read-only transaction: {e}"))?;
+    configure_readonly_session(&mut tx)?;
 
     let mut findings = parsed.static_findings.clone();
     let mut waterfall: Vec<CteStep> = Vec::new();
     let mut counts_by_cte: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
-    let mut prev_count: Option<i64> = None;
 
     // 1. CTE Row-Count Waterfall (execute each CTE + FINAL safely read-only)
     for idx in 0..parsed.ctes.len() {
@@ -83,14 +184,13 @@ pub fn run_live_audit(
             .map_err(|e| format!("failed counting CTE `{}`: {e}", cte.name))?;
         let count: i64 = row.get(0);
 
-        // Compare against the actual parent CTE in the DAG (max referenced parent row count),
-        // NOT an unrelated sibling lookup CTE!
         let parent_count: Option<i64> = cte
             .referenced_ctes
             .iter()
             .filter_map(|r| counts_by_cte.get(r).copied())
             .max();
-        let ratio = parent_count.and_then(|p| if p > 0 { Some(count as f64 / p as f64) } else { None });
+        let ratio = parent_count
+            .and_then(|p| if p > 0 { Some(count as f64 / p as f64) } else { None });
 
         if count == 0 && parent_count.unwrap_or(0) > 0 {
             findings.push(Finding {
@@ -137,12 +237,11 @@ pub fn run_live_audit(
             elapsed_ms: t0.elapsed().as_millis(),
         });
         counts_by_cte.insert(cte.name.clone(), count);
-        prev_count = Some(count);
     }
 
-    // FINAL row count
+    // FINAL row count — compare against actual DAG parent CTEs referenced by FINAL!
     let final_sql = format!(
-        "SELECT count(*)::bigint FROM ({}) AS _auditkeel_final",
+        "SELECT count(*)::bigint FROM (\n{}\n) AS _auditkeel_final",
         parsed.full_query_sql
     );
     let t_fin = Instant::now();
@@ -150,15 +249,23 @@ pub fn run_live_audit(
         .query_one(&final_sql, &[])
         .map_err(|e| format!("failed counting final query: {e}"))?
         .get(0);
-    let final_ratio = prev_count.and_then(|p| if p > 0 { Some(final_count as f64 / p as f64) } else { None });
-    if final_count == 0 && prev_count.unwrap_or(0) > 0 {
+
+    let final_parent_count: Option<i64> = parsed
+        .final_referenced_ctes
+        .iter()
+        .filter_map(|r| counts_by_cte.get(r).copied())
+        .max();
+    let final_ratio = final_parent_count
+        .and_then(|p| if p > 0 { Some(final_count as f64 / p as f64) } else { None });
+
+    if final_count == 0 && final_parent_count.unwrap_or(0) > 0 {
         findings.push(Finding {
             code: "ZERO_ROW_COLLAPSE".to_string(),
             severity: Severity::Error,
             location: "FINAL".to_string(),
             message: format!(
-                "FINAL query collapsed to 0 rows (down from {} in prior CTE).",
-                prev_count.unwrap_or(0)
+                "FINAL query collapsed to 0 rows (down from {} in parent CTE).",
+                final_parent_count.unwrap_or(0)
             ),
             fix_hint: "Check final WHERE predicates and INNER/LEFT JOIN conditions.".to_string(),
         });
@@ -172,29 +279,41 @@ pub fn run_live_audit(
             message: format!(
                 "FINAL query expanded rows by {:.2}x ({} -> {}).",
                 r,
-                prev_count.unwrap_or(0),
+                final_parent_count.unwrap_or(0),
                 final_count
             ),
             fix_hint: "Verify join cardinality on the final SELECT or pass `--key` to verify entity grain.".to_string(),
         });
     }
+    if let Some(min_r) = min_rows
+        && final_count < min_r
+    {
+        findings.push(Finding {
+            code: "MIN_ROWS_VIOLATION".to_string(),
+            severity: Severity::Error,
+            location: "FINAL".to_string(),
+            message: format!(
+                "FINAL query returned {final_count} row(s), below configured min_rows = {min_r}."
+            ),
+            fix_hint: "Verify upstream table sync completeness and WHERE filters.".to_string(),
+        });
+    }
+
     waterfall.push(CteStep {
         name: "FINAL".to_string(),
         row_count: final_count,
-        prev_row_count: prev_count,
+        prev_row_count: final_parent_count,
         ratio_vs_prev: final_ratio.map(|v| (v * 1000.0).round() / 1000.0),
-        referenced_ctes: parsed
-            .ctes
-            .last()
-            .map(|c| vec![c.name.clone()])
-            .unwrap_or_default(),
+        referenced_ctes: parsed.final_referenced_ctes.clone(),
         elapsed_ms: t_fin.elapsed().as_millis(),
     });
 
-    // 2. Live Join Cardinality, Fan-Out & Match Coverage Probes
+    // 2. Live Join Cardinality, Composite-Key Fan-Out & Match Coverage Probes
     let mut join_probes: Vec<JoinProbe> = Vec::new();
     for j in &parsed.joins {
         let probe = probe_join(&mut tx, parsed, j);
+        let lk_label = j.left_key_cols.join(", ");
+        let rk_label = j.right_key_cols.join(", ");
         if let Some(fanout) = probe.fanout_factor
             && fanout > max_fanout
         {
@@ -203,20 +322,18 @@ pub fn run_live_audit(
                 severity: Severity::Error,
                 location: format!("{} ({} -> {})", j.scope, j.left_relation, j.right_relation),
                 message: format!(
-                    "{} `{}` ON `{}.{} = {}.{}` fans out rows by {:.2}x (right table has {:.1}% duplicate keys, max {} rows/key).",
+                    "{} `{}` ON `({}) = ({})` fans out rows by {:.2}x (lookup side has {:.1}% duplicate keys, max {} rows/key).",
                     j.join_type,
                     j.right_relation,
-                    j.left_alias,
-                    j.left_key_col,
-                    j.right_alias,
-                    j.right_key_col,
+                    lk_label,
+                    rk_label,
                     fanout,
                     probe.right_dup_key_pct.unwrap_or(0.0),
                     probe.right_max_dupes.unwrap_or(1),
                 ),
                 fix_hint: format!(
-                    "Deduplicate `{}` to 1 row per `{}` using `SELECT DISTINCT ON ({}) ...` or aggregate before joining.",
-                    j.right_relation, j.right_key_col, j.right_key_col
+                    "Deduplicate `{}` to 1 row per ({}) using `SELECT DISTINCT ON ({}) ...` or pre-aggregate before joining.",
+                    j.right_relation, rk_label, rk_label
                 ),
             });
         }
@@ -229,12 +346,12 @@ pub fn run_live_audit(
                 severity: Severity::Warn,
                 location: format!("{} ({} -> {})", j.scope, j.left_relation, j.right_relation),
                 message: format!(
-                    "Only {:.1}% of left rows in `{}` matched `{}` on `{} = {}` ({} unmatched rows).",
+                    "Only {:.1}% of left rows in `{}` matched `{}` on `({}) = ({})` ({} unmatched rows).",
                     cov,
                     j.left_relation,
                     j.right_relation,
-                    j.left_key_col,
-                    j.right_key_col,
+                    lk_label,
+                    rk_label,
                     probe.unmatched_left_rows.unwrap_or(0),
                 ),
                 fix_hint: "Inspect sample_unmatched_keys for type/trim/leading-zero mismatches or missing bridge rows.".to_string(),
@@ -243,10 +360,10 @@ pub fn run_live_audit(
         join_probes.push(probe);
     }
 
-    // 3. Entity Grain Uniqueness & Concrete Spot-Check Traces (when --key provided)
+    // 3. Entity Grain Uniqueness & Concrete Spot-Check Traces (when --key or --rules provided)
     let grain = if !keys.is_empty() {
         let g = audit_grain(&mut tx, parsed, keys, spot_checks)?;
-        if !g.is_unique {
+        if g.duplicate_rows > 0 {
             findings.push(Finding {
                 code: "GRAIN_DUPLICATES".to_string(),
                 severity: Severity::Error,
@@ -267,14 +384,14 @@ pub fn run_live_audit(
         if g.null_key_rows > 0 {
             findings.push(Finding {
                 code: "NULL_GRAIN_KEY".to_string(),
-                severity: Severity::Warn,
+                severity: Severity::Error,
                 location: "FINAL".to_string(),
                 message: format!(
                     "{} final rows have NULL in grain key ({}).",
                     g.null_key_rows,
                     keys.join(", ")
                 ),
-                fix_hint: "Filter or coalesce NULL keys before final aggregation.".to_string(),
+                fix_hint: "Filter or coalesce NULL grain keys before final projection.".to_string(),
             });
         }
         Some(g)
@@ -302,14 +419,53 @@ pub fn run_live_audit(
     })
 }
 
+fn composite_key_expr(alias: &str, keys: &[String]) -> String {
+    // Collision-free JSONB array serialization (immune to embedded `|` or literal `<NULL>`)
+    let parts: Vec<String> = keys
+        .iter()
+        .map(|k| format!("({alias}.{})::text", quote_ident(k)))
+        .collect();
+    format!("jsonb_build_array({})::text", parts.join(", "))
+}
+
+fn non_null_all_expr(alias: &str, keys: &[String]) -> String {
+    keys.iter()
+        .map(|k| format!("{alias}.{} IS NOT NULL", quote_ident(k)))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn any_key_null_expr(alias: &str, keys: &[String]) -> String {
+    keys.iter()
+        .map(|k| format!("{alias}.{} IS NULL", quote_ident(k)))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 fn probe_join(tx: &mut Transaction<'_>, parsed: &ParsedQuery, j: &ParsedJoin) -> JoinProbe {
+    let (lrel, rrel, lcols, rcols) = if j.is_right {
+        (
+            &j.right_relation,
+            &j.left_relation,
+            &j.right_key_cols,
+            &j.left_key_cols,
+        )
+    } else {
+        (
+            &j.left_relation,
+            &j.right_relation,
+            &j.left_key_cols,
+            &j.right_key_cols,
+        )
+    };
+
     let mut base = JoinProbe {
         scope: j.scope.clone(),
         join_type: j.join_type.clone(),
         left_relation: j.left_relation.clone(),
         right_relation: j.right_relation.clone(),
-        left_key: j.left_key_col.clone(),
-        right_key: j.right_key_col.clone(),
+        left_key: j.left_key_cols.join(", "),
+        right_key: j.right_key_cols.join(", "),
         left_rows: None,
         right_rows: None,
         right_distinct_keys: None,
@@ -322,44 +478,54 @@ fn probe_join(tx: &mut Transaction<'_>, parsed: &ParsedQuery, j: &ParsedJoin) ->
         probe_error: None,
     };
 
-    if j.left_relation.starts_with('(') || j.right_relation.starts_with('(') {
+    if lrel.starts_with('(') || rrel.starts_with('(') || lcols.is_empty() || rcols.is_empty() {
         base.probe_error = Some("skipped derived subquery join probe".to_string());
         return base;
     }
 
     // Determine CTE prefix visible to j.scope
-    let cte_idx = if j.scope == "FINAL" {
+    let top_scope = j.scope.split('.').next().unwrap_or(&j.scope);
+    let cte_idx = if top_scope == "FINAL" {
         parsed.ctes.len()
     } else {
         parsed
             .ctes
             .iter()
-            .position(|c| c.name == j.scope)
+            .position(|c| c.name == top_scope)
             .unwrap_or(0)
     };
     let prefix = build_cte_prefix(parsed, cte_idx);
-    let lk = quote_ident(&j.left_key_col);
-    let rk = quote_ident(&j.right_key_col);
 
-    // Use a SAVEPOINT so a probe error never aborts the outer read-only transaction!
+    let r_kexpr = composite_key_expr("_r", rcols);
+    let r_not_null = non_null_all_expr("_r", rcols);
+    let l_kexpr = composite_key_expr("_l", lcols);
+    let join_eq = lcols
+        .iter()
+        .zip(rcols.iter())
+        .map(|(lc, rc)| {
+            format!(
+                "(_l.{})::text = (_r.{})::text",
+                quote_ident(lc),
+                quote_ident(rc)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
     let Ok(mut sp) = tx.savepoint("auditkeel_join_probe") else {
         base.probe_error = Some("failed to create savepoint".to_string());
         return base;
     };
 
     let stats_sql = format!(
-        "{prefix}
-        SELECT
-          (SELECT count(*)::bigint FROM {lrel}) AS l_rows,
-          (SELECT count(*)::bigint FROM {rrel}) AS r_rows,
-          (SELECT count(DISTINCT ({rk})::text)::bigint FROM {rrel} WHERE {rk} IS NOT NULL) AS r_dist,
-          coalesce((SELECT max(cnt)::bigint FROM (SELECT count(*) AS cnt FROM {rrel} WHERE {rk} IS NOT NULL GROUP BY ({rk})::text) _d), 0) AS r_max,
-          coalesce((SELECT count(*)::bigint FROM (SELECT 1 FROM {rrel} WHERE {rk} IS NOT NULL GROUP BY ({rk})::text HAVING count(*) > 1) _d2), 0) AS r_dup_keys,
-          (SELECT count(*)::bigint FROM {lrel} _l JOIN {rrel} _r ON (_l.{lk})::text = (_r.{rk})::text) AS joined_rows,
-          (SELECT count(*)::bigint FROM {lrel} _l WHERE EXISTS (SELECT 1 FROM {rrel} _r WHERE (_l.{lk})::text = (_r.{rk})::text)) AS matched_l
-        ",
-        lrel = j.left_relation,
-        rrel = j.right_relation,
+        "{prefix}SELECT
+          (SELECT count(*)::bigint FROM {lrel} _l) AS l_rows,
+          (SELECT count(*)::bigint FROM {rrel} _r) AS r_rows,
+          (SELECT count(DISTINCT {r_kexpr})::bigint FROM {rrel} _r WHERE {r_not_null}) AS r_dist,
+          coalesce((SELECT max(cnt)::bigint FROM (SELECT count(*) AS cnt FROM {rrel} _r WHERE {r_not_null} GROUP BY {r_kexpr}) _d), 0) AS r_max,
+          coalesce((SELECT count(*)::bigint FROM (SELECT 1 FROM {rrel} _r WHERE {r_not_null} GROUP BY {r_kexpr} HAVING count(*) > 1) _d2), 0) AS r_dup_keys,
+          (SELECT count(*)::bigint FROM {lrel} _l JOIN {rrel} _r ON {join_eq}) AS joined_rows,
+          (SELECT count(*)::bigint FROM {lrel} _l WHERE EXISTS (SELECT 1 FROM {rrel} _r WHERE {join_eq})) AS matched_l"
     );
 
     match sp.query_one(&stats_sql, &[]) {
@@ -395,13 +561,11 @@ fn probe_join(tx: &mut Transaction<'_>, parsed: &ParsedQuery, j: &ParsedJoin) ->
 
             if l_rows > matched_l {
                 let sample_sql = format!(
-                    "{prefix}
-                    SELECT DISTINCT coalesce((_l.{lk})::text, '<NULL>')
+                    "{prefix}SELECT DISTINCT {l_kexpr}
                     FROM {lrel} _l
-                    WHERE NOT EXISTS (SELECT 1 FROM {rrel} _r WHERE (_l.{lk})::text = (_r.{rk})::text)
-                    LIMIT 3",
-                    lrel = j.left_relation,
-                    rrel = j.right_relation,
+                    WHERE NOT EXISTS (SELECT 1 FROM {rrel} _r WHERE {join_eq})
+                    ORDER BY 1
+                    LIMIT 3"
                 );
                 if let Ok(srows) = sp.query(&sample_sql, &[]) {
                     base.sample_unmatched_keys = srows.into_iter().map(|r| r.get(0)).collect();
@@ -417,21 +581,6 @@ fn probe_join(tx: &mut Transaction<'_>, parsed: &ParsedQuery, j: &ParsedJoin) ->
     base
 }
 
-fn composite_key_expr(alias: &str, keys: &[String]) -> String {
-    let parts: Vec<String> = keys
-        .iter()
-        .map(|k| format!("coalesce(({alias}.{})::text, '<NULL>')", quote_ident(k)))
-        .collect();
-    parts.join(" || '|' || ")
-}
-
-fn any_key_null_expr(alias: &str, keys: &[String]) -> String {
-    keys.iter()
-        .map(|k| format!("{alias}.{} IS NULL", quote_ident(k)))
-        .collect::<Vec<_>>()
-        .join(" OR ")
-}
-
 fn audit_grain(
     tx: &mut Transaction<'_>,
     parsed: &ParsedQuery,
@@ -445,7 +594,7 @@ fn audit_grain(
            count(*)::bigint,
            count(DISTINCT ({kexpr}))::bigint,
            count(*) FILTER (WHERE {nexpr})::bigint
-         FROM ({}) AS _f",
+         FROM (\n{}\n) AS _f",
         parsed.full_query_sql
     );
     let row = tx
@@ -460,7 +609,7 @@ fn audit_grain(
     if dupes > 0 {
         let dup_sql = format!(
             "SELECT ({kexpr}) AS k
-             FROM ({}) AS _f
+             FROM (\n{}\n) AS _f
              GROUP BY 1 HAVING count(*) > 1
              ORDER BY count(*) DESC, 1
              LIMIT 3",
@@ -471,11 +620,10 @@ fn audit_grain(
         }
     }
 
-    // Spot-check concrete entity keys across every CTE that contains those key column(s)
     let mut traces = Vec::new();
     if spot_checks > 0 && total > 0 {
         let pick_sql = format!(
-            "SELECT DISTINCT ({kexpr}) AS k FROM ({}) AS _f ORDER BY 1 LIMIT {}",
+            "SELECT DISTINCT ({kexpr}) AS k FROM (\n{}\n) AS _f ORDER BY 1 LIMIT {}",
             parsed.full_query_sql, spot_checks
         );
         if let Ok(picked) = tx.query(&pick_sql, &[]) {
@@ -500,7 +648,7 @@ fn audit_grain(
                     }
                 }
                 let fin_probe = format!(
-                    "SELECT count(*)::bigint FROM ({}) AS _f WHERE ({kexpr}) = $1",
+                    "SELECT count(*)::bigint FROM (\n{}\n) AS _f WHERE ({kexpr}) = $1",
                     parsed.full_query_sql
                 );
                 if let Ok(fr) = tx.query_one(&fin_probe, &[&kval]) {
@@ -520,7 +668,7 @@ fn audit_grain(
         distinct_keys: distinct,
         duplicate_rows: dupes,
         null_key_rows: nulls,
-        is_unique: dupes == 0,
+        is_unique: dupes == 0 && nulls == 0,
         sample_duplicate_keys: sample_dupes,
         spot_checks: traces,
     })
@@ -534,29 +682,33 @@ pub fn run_live_diff(
     new_sql_raw: &str,
     keys: &[String],
 ) -> Result<DiffReport, String> {
-    let old_sql = old_sql_raw.trim().trim_end_matches(';').trim();
-    let new_sql = new_sql_raw.trim().trim_end_matches(';').trim();
+    let old_parsed = parse::analyze_sql(old_sql_raw)?;
+    let new_parsed = parse::analyze_sql(new_sql_raw)?;
+    let old_sql = &old_parsed.full_query_sql;
+    let new_sql = &new_parsed.full_query_sql;
+
     let mut client = connect_postgres(dsn)?;
     let mut tx = client
         .build_transaction()
         .read_only(true)
         .start()
         .map_err(|e| format!("failed to start read-only diff transaction: {e}"))?;
+    configure_readonly_session(&mut tx)?;
 
     let old_cnt: i64 = tx
-        .query_one(&format!("SELECT count(*)::bigint FROM ({old_sql}) _a"), &[])
+        .query_one(&format!("SELECT count(*)::bigint FROM (\n{old_sql}\n) _a"), &[])
         .map_err(|e| format!("old query failed: {e}"))?
         .get(0);
     let new_cnt: i64 = tx
-        .query_one(&format!("SELECT count(*)::bigint FROM ({new_sql}) _b"), &[])
+        .query_one(&format!("SELECT count(*)::bigint FROM (\n{new_sql}\n) _b"), &[])
         .map_err(|e| format!("new query failed: {e}"))?
         .get(0);
 
     let old_stmt = tx
-        .prepare(&format!("SELECT * FROM ({old_sql}) _a LIMIT 0"))
+        .prepare(&format!("SELECT * FROM (\n{old_sql}\n) _a LIMIT 0"))
         .map_err(|e| format!("failed inspecting old columns: {e}"))?;
     let new_stmt = tx
-        .prepare(&format!("SELECT * FROM ({new_sql}) _b LIMIT 0"))
+        .prepare(&format!("SELECT * FROM (\n{new_sql}\n) _b LIMIT 0"))
         .map_err(|e| format!("failed inspecting new columns: {e}"))?;
 
     let old_cols: Vec<(String, String)> = old_stmt
@@ -583,13 +735,13 @@ pub fn run_live_diff(
         .map(|(n, _)| n.clone())
         .collect();
 
-    // Key overlap diff
+    // Key overlap diff (collision-free JSONB keys)
     let key_overlap = if !keys.is_empty() {
         let ka = composite_key_expr("_a", keys);
         let kb = composite_key_expr("_b", keys);
         let ov_sql = format!(
-            "WITH a AS (SELECT DISTINCT ({ka}) AS k FROM ({old_sql}) _a),
-                  b AS (SELECT DISTINCT ({kb}) AS k FROM ({new_sql}) _b)
+            "WITH a AS (SELECT DISTINCT ({ka}) AS k FROM (\n{old_sql}\n) _a),
+                  b AS (SELECT DISTINCT ({kb}) AS k FROM (\n{new_sql}\n) _b)
              SELECT
                (SELECT count(*)::bigint FROM a JOIN b USING (k)),
                (SELECT count(*)::bigint FROM a LEFT JOIN b USING (k) WHERE b.k IS NULL),
@@ -605,8 +757,8 @@ pub fn run_live_diff(
         let sample_old: Vec<String> = if only_old > 0 {
             tx.query(
                 &format!(
-                    "WITH a AS (SELECT DISTINCT ({ka}) AS k FROM ({old_sql}) _a),
-                          b AS (SELECT DISTINCT ({kb}) AS k FROM ({new_sql}) _b)
+                    "WITH a AS (SELECT DISTINCT ({ka}) AS k FROM (\n{old_sql}\n) _a),
+                          b AS (SELECT DISTINCT ({kb}) AS k FROM (\n{new_sql}\n) _b)
                      SELECT a.k FROM a LEFT JOIN b USING (k) WHERE b.k IS NULL ORDER BY 1 LIMIT 3"
                 ),
                 &[],
@@ -621,8 +773,8 @@ pub fn run_live_diff(
         let sample_new: Vec<String> = if only_new > 0 {
             tx.query(
                 &format!(
-                    "WITH a AS (SELECT DISTINCT ({ka}) AS k FROM ({old_sql}) _a),
-                          b AS (SELECT DISTINCT ({kb}) AS k FROM ({new_sql}) _b)
+                    "WITH a AS (SELECT DISTINCT ({ka}) AS k FROM (\n{old_sql}\n) _a),
+                          b AS (SELECT DISTINCT ({kb}) AS k FROM (\n{new_sql}\n) _b)
                      SELECT b.k FROM b LEFT JOIN a USING (k) WHERE a.k IS NULL ORDER BY 1 LIMIT 3"
                 ),
                 &[],
@@ -647,43 +799,59 @@ pub fn run_live_diff(
         None
     };
 
-    // Numeric column aggregate drift
+    // Batched numeric column aggregate drift (ONE scan of old_sql + ONE scan of new_sql!)
     let numeric_types = ["int2", "int4", "int8", "float4", "float8", "numeric"];
+    let common_num_cols: Vec<&str> = old_cols
+        .iter()
+        .filter(|(c, ty)| new_set.contains(c.as_str()) && numeric_types.contains(&ty.as_str()))
+        .map(|(c, _)| c.as_str())
+        .collect();
+
     let mut numeric_diffs = Vec::new();
-    for (col_name, ty_name) in &old_cols {
-        if !new_set.contains(col_name.as_str()) || !numeric_types.contains(&ty_name.as_str()) {
-            continue;
-        }
-        let qcol = quote_ident(col_name);
-        let agg_old = tx.query_one(
-            &format!(
-                "SELECT sum(({qcol})::double precision), count(*) FILTER (WHERE {qcol} IS NULL)::bigint FROM ({old_sql}) _a"
-            ),
-            &[],
-        );
-        let agg_new = tx.query_one(
-            &format!(
-                "SELECT sum(({qcol})::double precision), count(*) FILTER (WHERE {qcol} IS NULL)::bigint FROM ({new_sql}) _b"
-            ),
-            &[],
-        );
-        if let (Ok(ro), Ok(rn)) = (agg_old, agg_new) {
-            let os: Option<f64> = ro.get(0);
-            let on: i64 = ro.get(1);
-            let ns: Option<f64> = rn.get(0);
-            let nn: i64 = rn.get(1);
-            let delta = match (os, ns) {
-                (Some(a), Some(b)) => Some(((b - a) * 1000.0).round() / 1000.0),
-                _ => None,
-            };
-            numeric_diffs.push(NumericColDiff {
-                column: col_name.clone(),
-                old_sum: os.map(|v| (v * 1000.0).round() / 1000.0),
-                new_sum: ns.map(|v| (v * 1000.0).round() / 1000.0),
-                sum_delta: delta,
-                old_nulls: on,
-                new_nulls: nn,
-            });
+    let mut num_drifted = false;
+
+    if !common_num_cols.is_empty() {
+        let select_exprs: Vec<String> = common_num_cols
+            .iter()
+            .map(|c| {
+                let q = quote_ident(c);
+                format!(
+                    "sum(({q})::double precision), count(*) FILTER (WHERE {q} IS NULL)::bigint"
+                )
+            })
+            .collect();
+        let proj = select_exprs.join(", ");
+        let old_agg = tx.query_one(&format!("SELECT {proj} FROM (\n{old_sql}\n) _a"), &[]);
+        let new_agg = tx.query_one(&format!("SELECT {proj} FROM (\n{new_sql}\n) _b"), &[]);
+
+        if let (Ok(ro), Ok(rn)) = (old_agg, new_agg) {
+            for (idx, col_name) in common_num_cols.iter().enumerate() {
+                let os: Option<f64> = ro.get(idx * 2);
+                let on: i64 = ro.get(idx * 2 + 1);
+                let ns: Option<f64> = rn.get(idx * 2);
+                let nn: i64 = rn.get(idx * 2 + 1);
+
+                let raw_delta = match (os, ns) {
+                    (Some(a), Some(b)) => Some(b - a),
+                    _ => None,
+                };
+                let nan_or_presence_changed = os.map(f64::is_nan) != ns.map(f64::is_nan)
+                    || os.is_some() != ns.is_some();
+                if nan_or_presence_changed
+                    || raw_delta.is_some_and(|v| !v.is_finite() || v.abs() > 1e-6)
+                    || on != nn
+                {
+                    num_drifted = true;
+                }
+                numeric_diffs.push(NumericColDiff {
+                    column: (*col_name).to_string(),
+                    old_sum: os.map(|v| if v.is_finite() { (v * 1000.0).round() / 1000.0 } else { v }),
+                    new_sum: ns.map(|v| if v.is_finite() { (v * 1000.0).round() / 1000.0 } else { v }),
+                    sum_delta: raw_delta.map(|v| if v.is_finite() { (v * 1_000_000.0).round() / 1_000_000.0 } else { v }),
+                    old_nulls: on,
+                    new_nulls: nn,
+                });
+            }
         }
     }
 
@@ -692,9 +860,6 @@ pub fn run_live_diff(
     let key_drifted = key_overlap
         .as_ref()
         .is_some_and(|k| k.only_in_old > 0 || k.only_in_new > 0);
-    let num_drifted = numeric_diffs
-        .iter()
-        .any(|d| d.sum_delta.is_some_and(|v| v.abs() > 1e-6) || d.old_nulls != d.new_nulls);
     let has_drift = row_delta != 0
         || !added_columns.is_empty()
         || !removed_columns.is_empty()

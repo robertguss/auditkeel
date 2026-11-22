@@ -65,12 +65,16 @@ pub enum Command {
         sql: Option<String>,
 
         /// PostgreSQL connection URL (or set DATABASE_URL).
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         dsn: String,
 
         /// Expected entity grain key column(s), comma-separated (e.g. `student_id` or `sid,tid`).
         #[arg(long)]
         key: Option<String>,
+
+        /// Optional audit rules TOML file (e.g. emitted by `feakeel compile --emit-audit-rules`).
+        #[arg(long)]
+        rules: Option<PathBuf>,
 
         /// Number of concrete entity spot-check traces to include when `--key` is set.
         #[arg(long, default_value_t = 3)]
@@ -120,7 +124,7 @@ pub enum Command {
         new_file: PathBuf,
 
         /// PostgreSQL connection URL (or set DATABASE_URL).
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         dsn: String,
 
         /// Entity key column(s), comma-separated, to compute added/dropped keys.

@@ -16,6 +16,20 @@ use std::process::ExitCode;
 use clap::Parser;
 use cli::{Cli, Command, FailOn, OutputFormat};
 use model::{AuditReport, DiffReport, Finding, Severity};
+use serde::Deserialize;
+
+#[derive(Debug, Default, Deserialize)]
+struct AuditRulesFile {
+    grain: Option<GrainRules>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GrainRules {
+    #[serde(default)]
+    unique_keys: Vec<String>,
+    forbid_fanout: Option<bool>,
+    min_rows: Option<i64>,
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -93,6 +107,7 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
             sql,
             dsn,
             key,
+            rules,
             spot_checks,
             max_fanout,
             html: html_path,
@@ -101,7 +116,7 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
         } => {
             let (source, raw_sql) = read_sql_input(file.as_deref(), sql.as_deref())?;
             let parsed = parse::analyze_sql(&raw_sql)?;
-            let keys: Vec<String> = key
+            let mut keys: Vec<String> = key
                 .as_deref()
                 .map(|k| {
                     k.split(',')
@@ -110,6 +125,25 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let mut eff_max_fanout = max_fanout;
+            let mut min_rows: Option<i64> = None;
+
+            if let Some(rules_path) = rules {
+                let txt = fs::read_to_string(&rules_path)
+                    .map_err(|e| format!("failed to read rules {}: {e}", rules_path.display()))?;
+                let rf: AuditRulesFile = toml::from_str(&txt)
+                    .map_err(|e| format!("failed parsing rules {}: {e}", rules_path.display()))?;
+                if let Some(gr) = rf.grain {
+                    if keys.is_empty() && !gr.unique_keys.is_empty() {
+                        keys = gr.unique_keys;
+                    }
+                    if gr.forbid_fanout == Some(true) && eff_max_fanout > 1.0 {
+                        eff_max_fanout = 1.0001;
+                    }
+                    min_rows = gr.min_rows;
+                }
+            }
+
             let report = pg::run_live_audit(
                 &dsn,
                 &source,
@@ -117,10 +151,11 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
                 &parsed,
                 &keys,
                 spot_checks,
-                max_fanout,
+                eff_max_fanout,
+                min_rows,
             )?;
             if let Some(out_html) = html_path {
-                let rendered = html::render_audit_html(&report);
+                let rendered = html::render_audit_html(&report, eff_max_fanout);
                 if let Some(parent) = out_html.parent()
                     && !parent.as_os_str().is_empty()
                 {

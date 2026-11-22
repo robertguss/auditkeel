@@ -7,9 +7,18 @@ fn esc(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
-pub fn render_audit_html(r: &AuditReport) -> String {
+fn fmt_opt_f64(val: Option<f64>) -> String {
+    match val {
+        Some(v) if v.is_nan() => "NaN".to_string(),
+        Some(v) => format!("{v:.3}"),
+        None => "&mdash;".to_string(),
+    }
+}
+
+pub fn render_audit_html(r: &AuditReport, max_fanout: f64) -> String {
     let max_rows = r
         .waterfall
         .iter()
@@ -29,7 +38,7 @@ pub fn render_audit_html(r: &AuditReport) -> String {
         let w = ((step.row_count as f64 / max_rows as f64) * 320.0).max(4.0);
         let fill = if step.row_count == 0 {
             "#c53030"
-        } else if step.ratio_vs_prev.is_some_and(|rv| rv > 1.02) {
+        } else if step.ratio_vs_prev.is_some_and(|rv| rv > max_fanout) {
             "#c05621"
         } else {
             "#1d4ed8"
@@ -64,19 +73,32 @@ pub fn render_audit_html(r: &AuditReport) -> String {
         .joins
         .iter()
         .map(|j| {
-            format!(
-                "<tr><td>{}</td><td><strong>{}</strong></td><td>{} &rarr; {}</td><td>{} = {}</td><td><strong>{:.2}x</strong></td><td>{:.1}%</td><td>{:.1}% (max {})</td></tr>",
-                esc(&j.scope),
-                esc(&j.join_type),
-                esc(&j.left_relation),
-                esc(&j.right_relation),
-                esc(&j.left_key),
-                esc(&j.right_key),
-                j.fanout_factor.unwrap_or(1.0),
-                j.matched_left_pct.unwrap_or(0.0),
-                j.right_dup_key_pct.unwrap_or(0.0),
-                j.right_max_dupes.unwrap_or(0),
-            )
+            if let Some(err) = &j.probe_error {
+                format!(
+                    "<tr><td>{}</td><td><strong>{}</strong></td><td>{} &rarr; {}</td><td>{} = {}</td><td colspan=\"3\" style=\"color:#52667a\"><em>{}</em></td></tr>",
+                    esc(&j.scope),
+                    esc(&j.join_type),
+                    esc(&j.left_relation),
+                    esc(&j.right_relation),
+                    esc(&j.left_key),
+                    esc(&j.right_key),
+                    esc(err),
+                )
+            } else {
+                format!(
+                    "<tr><td>{}</td><td><strong>{}</strong></td><td>{} &rarr; {}</td><td>{} = {}</td><td><strong>{:.2}x</strong></td><td>{:.1}%</td><td>{:.1}% (max {})</td></tr>",
+                    esc(&j.scope),
+                    esc(&j.join_type),
+                    esc(&j.left_relation),
+                    esc(&j.right_relation),
+                    esc(&j.left_key),
+                    esc(&j.right_key),
+                    j.fanout_factor.unwrap_or(1.0),
+                    j.matched_left_pct.unwrap_or(0.0),
+                    j.right_dup_key_pct.unwrap_or(0.0),
+                    j.right_max_dupes.unwrap_or(0),
+                )
+            }
         })
         .collect();
 
@@ -122,13 +144,20 @@ pub fn render_audit_html(r: &AuditReport) -> String {
                     )
                 })
                 .collect();
+            let status_txt = if g.is_unique {
+                "UNIQUE"
+            } else if g.null_key_rows > 0 && g.duplicate_rows == 0 {
+                "NULL KEYS FOUND"
+            } else {
+                "DUPLICATES FOUND"
+            };
             format!(
-                "<div class=\"card\"><h2>Entity Grain &amp; Spot-Check Receipts</h2><p>Key: <code>{}</code> &middot; Status: <strong>{}</strong> &middot; Rows: {} &middot; Distinct: {} &middot; Dupes: {}</p><ul>{}</ul></div>",
+                "<div class=\"card\"><h2>Entity Grain &amp; Spot-Check Receipts</h2><p>Key: <code>{}</code> &middot; Status: <strong>{status_txt}</strong> &middot; Rows: {} &middot; Distinct: {} &middot; Dupes: {} &middot; Null Keys: {}</p><ul>{}</ul></div>",
                 esc(&g.key_columns.join(", ")),
-                if g.is_unique { "UNIQUE" } else { "DUPLICATES FOUND" },
                 g.total_rows,
                 g.distinct_keys,
                 g.duplicate_rows,
+                g.null_key_rows,
                 traces
             )
         })
@@ -185,16 +214,48 @@ pub fn render_audit_html(r: &AuditReport) -> String {
 }
 
 pub fn render_diff_html(d: &DiffReport) -> String {
+    let schema_html = if !d.added_columns.is_empty() || !d.removed_columns.is_empty() {
+        format!(
+            "<div class=\"card\"><h2>Schema Drift</h2><p>Added: <code>{}</code> &middot; Removed: <code>{}</code></p></div>",
+            if d.added_columns.is_empty() {
+                "none".to_string()
+            } else {
+                esc(&d.added_columns.join(", "))
+            },
+            if d.removed_columns.is_empty() {
+                "none".to_string()
+            } else {
+                esc(&d.removed_columns.join(", "))
+            }
+        )
+    } else {
+        String::new()
+    };
+
+    let key_html = d
+        .key_overlap
+        .as_ref()
+        .map(|k| {
+            format!(
+                "<div class=\"card\"><h2>Key Overlap ({})</h2><p>In Both: <strong>{}</strong> &middot; Only in Old: <strong>{}</strong> &middot; Only in New: <strong>{}</strong></p></div>",
+                esc(&k.key_columns.join(", ")),
+                k.in_both,
+                k.only_in_old,
+                k.only_in_new
+            )
+        })
+        .unwrap_or_default();
+
     let num_rows: String = d
         .numeric_diffs
         .iter()
         .map(|n| {
             format!(
-                "<tr><td><strong>{}</strong></td><td>{:?}</td><td>{:?}</td><td><strong>{:?}</strong></td><td>{} &rarr; {}</td></tr>",
+                "<tr><td><strong>{}</strong></td><td>{}</td><td>{}</td><td><strong>{}</strong></td><td>{} &rarr; {}</td></tr>",
                 esc(&n.column),
-                n.old_sum,
-                n.new_sum,
-                n.sum_delta,
+                fmt_opt_f64(n.old_sum),
+                fmt_opt_f64(n.new_sum),
+                fmt_opt_f64(n.sum_delta),
                 n.old_nulls,
                 n.new_nulls
             )
@@ -206,6 +267,8 @@ pub fn render_diff_html(d: &DiffReport) -> String {
 <style>body{{margin:0;font-family:ui-sans-serif,system-ui,sans-serif;background:#f6f8fb;color:#102a43}}.wrap{{max-width:1000px;margin:0 auto;padding:22px}}.card{{background:#fff;border:1px solid #d9e2ec;border-radius:12px;padding:18px;margin-bottom:16px}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:8px;border-bottom:1px solid #d9e2ec}}</style>
 </head><body><div class="wrap">
 <div class="card"><h1>auditkeel Live SQL Diff: {st}</h1><p>{old} ({oc} rows) &rarr; {new} ({nc} rows, delta {rd:+})</p></div>
+{schema_html}
+{key_html}
 <div class="card"><h2>Numeric Column Aggregate Drift</h2><table><thead><tr><th>Column</th><th>Old Sum</th><th>New Sum</th><th>Delta</th><th>Nulls</th></tr></thead><tbody>{num_rows}</tbody></table></div>
 </div></body></html>"#,
         st = esc(&d.status.to_uppercase()),

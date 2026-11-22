@@ -1,10 +1,11 @@
-//! PostgreSQL SQL AST extraction (CTEs, JOIN specs, static semantic audits).
+//! PostgreSQL SQL AST extraction (CTEs, composite JOIN specs, recursive static audits).
 
 use std::collections::HashSet;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, InTarget, JoinConstraint, JoinOperator, Query, Select, SetExpr,
-    Statement, TableFactor, TableWithJoins,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget,
+    JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    TableWithJoins,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -14,6 +15,7 @@ use crate::model::{Finding, Severity};
 #[derive(Debug, Clone)]
 pub struct ParsedCte {
     pub name: String,
+    pub alias_columns: Vec<String>,
     pub query_sql: String,
     pub referenced_ctes: Vec<String>,
 }
@@ -22,17 +24,22 @@ pub struct ParsedCte {
 pub struct ParsedJoin {
     pub scope: String,
     pub join_type: String,
+    pub is_right: bool,
     pub left_relation: String,
+    #[allow(dead_code)]
     pub left_alias: String,
     pub right_relation: String,
+    #[allow(dead_code)]
     pub right_alias: String,
-    pub left_key_col: String,
-    pub right_key_col: String,
+    pub left_key_cols: Vec<String>,
+    pub right_key_cols: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
+    pub with_recursive: bool,
     pub ctes: Vec<ParsedCte>,
+    pub final_referenced_ctes: Vec<String>,
     pub full_query_sql: String,
     pub joins: Vec<ParsedJoin>,
     pub static_findings: Vec<Finding>,
@@ -89,15 +96,24 @@ pub fn analyze_sql(raw_sql: &str) -> Result<ParsedQuery, String> {
     let mut ctes = Vec::new();
     let mut joins = Vec::new();
     let mut known_ctes: Vec<String> = Vec::new();
+    let mut with_recursive = false;
 
     if let Some(with) = &query_stmt.with {
+        with_recursive = with.recursive;
         for cte in &with.cte_tables {
             let name = cte.alias.name.value.clone();
+            let alias_columns = cte
+                .alias
+                .columns
+                .iter()
+                .map(|c| c.name.value.clone())
+                .collect();
             let q_sql = cte.query.to_string();
-            let refs = find_referenced_ctes(&q_sql, &known_ctes);
+            let refs = find_referenced_ctes_ast(&cte.query, &known_ctes);
             inspect_query(&name, &cte.query, &mut joins, &mut findings);
             ctes.push(ParsedCte {
                 name: name.clone(),
+                alias_columns,
                 query_sql: q_sql,
                 referenced_ctes: refs,
             });
@@ -108,28 +124,105 @@ pub fn analyze_sql(raw_sql: &str) -> Result<ParsedQuery, String> {
     // Inspect final query body without WITH prefix
     let mut final_only = query_stmt.clone();
     final_only.with = None;
+    let final_referenced_ctes = find_referenced_ctes_ast(&final_only, &known_ctes);
     inspect_query("FINAL", &final_only, &mut joins, &mut findings);
 
     Ok(ParsedQuery {
+        with_recursive,
         ctes,
-        full_query_sql: trimmed.to_string(),
+        final_referenced_ctes,
+        // Use AST-serialized single query so multi-statements & trailing comments never break wrapping
+        full_query_sql: query_stmt.to_string(),
         joins,
         static_findings: findings,
     })
 }
 
-fn find_referenced_ctes(sql_text: &str, prior_ctes: &[String]) -> Vec<String> {
-    let lower = sql_text.to_lowercase();
+fn find_referenced_ctes_ast(query: &Query, prior_ctes: &[String]) -> Vec<String> {
+    let mut tables = HashSet::new();
+    collect_query_table_names(query, &mut tables);
     prior_ctes
         .iter()
-        .filter(|name| {
-            let needle = name.to_lowercase();
-            lower
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .any(|tok| tok == needle)
-        })
+        .filter(|name| tables.contains(&name.to_lowercase()))
         .cloned()
         .collect()
+}
+
+fn collect_query_table_names(query: &Query, out: &mut HashSet<String>) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_query_table_names(&cte.query, out);
+        }
+    }
+    collect_set_expr_table_names(query.body.as_ref(), out);
+}
+
+fn collect_set_expr_table_names(body: &SetExpr, out: &mut HashSet<String>) {
+    match body {
+        SetExpr::Select(sel) => {
+            for twj in &sel.from {
+                collect_factor_table_names(&twj.relation, out);
+                for j in &twj.joins {
+                    collect_factor_table_names(&j.relation, out);
+                }
+            }
+            if let Some(sel_expr) = &sel.selection {
+                collect_expr_subquery_tables(sel_expr, out);
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_set_expr_table_names(left, out);
+            collect_set_expr_table_names(right, out);
+        }
+        SetExpr::Query(q) => collect_query_table_names(q, out),
+        _ => {}
+    }
+}
+
+fn collect_factor_table_names(factor: &TableFactor, out: &mut HashSet<String>) {
+    match factor {
+        TableFactor::Table { name, .. } => {
+            if name.0.len() == 1
+                && let Some(ident) = name.0[0].as_ident()
+            {
+                out.insert(ident.value.to_lowercase());
+            }
+        }
+        TableFactor::Derived { subquery, .. } => collect_query_table_names(subquery, out),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_factor_table_names(&table_with_joins.relation, out);
+            for j in &table_with_joins.joins {
+                collect_factor_table_names(&j.relation, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_expr_subquery_tables(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => collect_query_table_names(q, out),
+        Expr::In {
+            expr: inner,
+            target,
+            ..
+        } => {
+            collect_expr_subquery_tables(inner, out);
+            if let InTarget::Subquery(q) = target {
+                collect_query_table_names(q, out);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_subquery_tables(left, out);
+            collect_expr_subquery_tables(right, out);
+        }
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+            collect_expr_subquery_tables(inner, out);
+        }
+        _ => {}
+    }
 }
 
 fn inspect_query(
@@ -138,15 +231,29 @@ fn inspect_query(
     joins_out: &mut Vec<ParsedJoin>,
     findings: &mut Vec<Finding>,
 ) {
-    if let SetExpr::Select(sel) = query.body.as_ref() {
-        inspect_select(scope, sel, joins_out, findings);
-    } else if let SetExpr::SetOperation { left, right, .. } = query.body.as_ref() {
-        if let SetExpr::Select(sel) = left.as_ref() {
-            inspect_select(scope, sel, joins_out, findings);
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            let sub_scope = format!("{scope}.{}", cte.alias.name.value);
+            inspect_query(&sub_scope, &cte.query, joins_out, findings);
         }
-        if let SetExpr::Select(sel) = right.as_ref() {
-            inspect_select(scope, sel, joins_out, findings);
+    }
+    inspect_set_expr(scope, query.body.as_ref(), joins_out, findings);
+}
+
+fn inspect_set_expr(
+    scope: &str,
+    body: &SetExpr,
+    joins_out: &mut Vec<ParsedJoin>,
+    findings: &mut Vec<Finding>,
+) {
+    match body {
+        SetExpr::Select(sel) => inspect_select(scope, sel, joins_out, findings),
+        SetExpr::SetOperation { left, right, .. } => {
+            inspect_set_expr(scope, left, joins_out, findings);
+            inspect_set_expr(scope, right, joins_out, findings);
         }
+        SetExpr::Query(q) => inspect_query(scope, q, joins_out, findings),
+        _ => {}
     }
 }
 
@@ -183,15 +290,18 @@ fn inspect_select(
     joins_out: &mut Vec<ParsedJoin>,
     findings: &mut Vec<Finding>,
 ) {
-    // 1. Check SELECT * in FINAL query
+    // 1. Check SELECT * / s.* in FINAL query
     if scope == "FINAL" {
         for item in &sel.projection {
-            if matches!(item, sqlparser::ast::SelectItem::Wildcard(_)) {
+            if matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            ) {
                 findings.push(Finding {
                     code: "SELECT_STAR".to_string(),
                     severity: Severity::Info,
                     location: scope.to_string(),
-                    message: "Final query uses `SELECT *`, which can silently drift columns or leak PII.".to_string(),
+                    message: "Final query uses `SELECT *` (or `alias.*`), which can silently drift columns or leak PII.".to_string(),
                     fix_hint: "Explicitly list output columns in the final SELECT.".to_string(),
                 });
                 break;
@@ -199,9 +309,10 @@ fn inspect_select(
         }
     }
 
-    // 2. Inspect FROM + JOINs
+    // 2. Inspect FROM + JOINs (and recurse into derived / LATERAL subqueries!)
     let mut left_joined_aliases: Vec<(String, String)> = Vec::new();
-    let mut referenced_relations: Vec<String> = Vec::new();
+    // (relation, alias, optional JOIN ON sql)
+    let mut referenced_relations: Vec<(String, String, String)> = Vec::new();
 
     for twj in &sel.from {
         inspect_table_with_joins(
@@ -210,10 +321,11 @@ fn inspect_select(
             &mut left_joined_aliases,
             &mut referenced_relations,
             joins_out,
+            findings,
         );
     }
 
-    // 3. Check WHERE clause for LEFT JOIN demotion + NOT IN null traps + soft-delete filtering
+    // 3. Check WHERE clause for LEFT JOIN demotion + NOT IN null traps + nested subqueries
     let where_sql = sel
         .selection
         .as_ref()
@@ -221,7 +333,7 @@ fn inspect_select(
         .unwrap_or_default();
 
     if let Some(where_expr) = &sel.selection {
-        check_not_in_subquery(scope, where_expr, findings);
+        check_not_in_and_subqueries(scope, where_expr, joins_out, findings);
         for (alias, right_rel) in &left_joined_aliases {
             if is_alias_filtered_non_null(where_expr, alias) {
                 findings.push(Finding {
@@ -239,26 +351,38 @@ fn inspect_select(
         }
     }
 
-    // 4. Warn if known LMS/Canvas soft-delete tables lack a workflow_state/deleted filter
-    for rel in &referenced_relations {
+    // 4. Warn if known Canvas soft-delete tables lack a workflow_state/deleted filter
+    //    Checking BOTH that table's own JOIN ON clause AND WHERE clause (qualified to its alias when multi-table!)
+    let single_table = referenced_relations.len() == 1;
+    for (rel, alias, on_sql) in &referenced_relations {
         let low = rel.to_lowercase();
         let short = low.rsplit('.').next().unwrap_or(&low).trim_matches('"');
-        if low.contains("canvas.")
-            && SOFT_DELETE_TABLES.contains(&short)
-            && !where_sql.contains("workflow_state")
-            && !where_sql.contains("deleted")
-        {
-            findings.push(Finding {
-                code: "SOFT_DELETE_UNFILTERED".to_string(),
-                severity: Severity::Warn,
-                location: scope.to_string(),
-                message: format!(
-                    "Canvas table `{rel}` is queried without filtering `workflow_state <> 'deleted'`."
-                ),
-                fix_hint: format!(
-                    "Add `workflow_state <> 'deleted'` (or `workflow_state = 'active'`) on `{rel}`."
-                ),
-            });
+        if low.contains("canvas.") && SOFT_DELETE_TABLES.contains(&short) {
+            let combined = format!("{on_sql} {where_sql}");
+            let al_low = alias.to_lowercase();
+            let has_filter = if single_table {
+                combined.contains("workflow_state") || combined.contains("deleted")
+            } else {
+                combined.contains(&format!("{al_low}.workflow_state"))
+                    || combined.contains(&format!("\"{al_low}\".workflow_state"))
+                    || combined.contains(&format!("{al_low}.deleted"))
+                    || combined.contains(&format!("\"{al_low}\".deleted"))
+                    || on_sql.contains("workflow_state")
+                    || on_sql.contains("deleted")
+            };
+            if !has_filter {
+                findings.push(Finding {
+                    code: "SOFT_DELETE_UNFILTERED".to_string(),
+                    severity: Severity::Warn,
+                    location: scope.to_string(),
+                    message: format!(
+                        "Canvas table `{rel}` (alias `{alias}`) is queried without filtering `workflow_state <> 'deleted'`."
+                    ),
+                    fix_hint: format!(
+                        "Add `{alias}.workflow_state <> 'deleted'` (or `workflow_state = 'active'`) in the JOIN ON or WHERE clause."
+                    ),
+                });
+            }
         }
     }
 }
@@ -267,73 +391,137 @@ fn inspect_table_with_joins(
     scope: &str,
     twj: &TableWithJoins,
     left_joined_aliases: &mut Vec<(String, String)>,
-    referenced_relations: &mut Vec<String>,
+    referenced_relations: &mut Vec<(String, String, String)>,
     joins_out: &mut Vec<ParsedJoin>,
+    findings: &mut Vec<Finding>,
 ) {
+    if let TableFactor::Derived {
+        subquery, alias, ..
+    } = &twj.relation
+    {
+        let sub_name = alias
+            .as_ref()
+            .map(|a| format!("{scope}.{}", a.name.value))
+            .unwrap_or_else(|| format!("{scope}.subquery"));
+        inspect_query(&sub_name, subquery, joins_out, findings);
+    }
+
     let Some((base_rel, base_alias)) = table_name_and_alias(&twj.relation) else {
         return;
     };
-    referenced_relations.push(base_rel.clone());
+    referenced_relations.push((base_rel.clone(), base_alias.clone(), String::new()));
     let mut alias_map: Vec<(String, String)> = vec![(base_alias.clone(), base_rel.clone())];
 
     for join in &twj.joins {
+        if let TableFactor::Derived {
+            subquery, alias, ..
+        } = &join.relation
+        {
+            let sub_name = alias
+                .as_ref()
+                .map(|a| format!("{scope}.{}", a.name.value))
+                .unwrap_or_else(|| format!("{scope}.lateral"));
+            inspect_query(&sub_name, subquery, joins_out, findings);
+        }
+
         let Some((right_rel, right_alias)) = table_name_and_alias(&join.relation) else {
             continue;
         };
-        referenced_relations.push(right_rel.clone());
 
-        let (jtype, is_left, constraint) = match &join.join_operator {
-            JoinOperator::Inner(c) | JoinOperator::Join(c) => ("INNER JOIN", false, Some(c)),
-            JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => ("LEFT JOIN", true, Some(c)),
-            JoinOperator::Right(c) | JoinOperator::RightOuter(c) => ("RIGHT JOIN", false, Some(c)),
-            JoinOperator::FullOuter(c) => ("FULL OUTER JOIN", false, Some(c)),
-            _ => ("CROSS/OTHER JOIN", false, None),
+        let (jtype, is_left, is_right, constraint) = match &join.join_operator {
+            JoinOperator::Inner(c) | JoinOperator::Join(c) => ("INNER JOIN", false, false, Some(c)),
+            JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => {
+                ("LEFT JOIN", true, false, Some(c))
+            }
+            JoinOperator::Right(c) | JoinOperator::RightOuter(c) => {
+                ("RIGHT JOIN", false, true, Some(c))
+            }
+            JoinOperator::FullOuter(c) => ("FULL OUTER JOIN", false, false, Some(c)),
+            _ => ("CROSS/OTHER JOIN", false, false, None),
         };
+
+        let on_sql = match constraint {
+            Some(JoinConstraint::On(e)) => e.to_string().to_lowercase(),
+            _ => String::new(),
+        };
+        referenced_relations.push((right_rel.clone(), right_alias.clone(), on_sql));
 
         if is_left {
             left_joined_aliases.push((right_alias.clone(), right_rel.clone()));
         }
 
-        if let Some(JoinConstraint::On(expr)) = constraint {
-            let mut eq_pairs = Vec::new();
-            collect_eq_pairs(expr, &mut eq_pairs);
-            for (l_al, l_col, r_al, r_col) in eq_pairs {
-                if r_al.eq_ignore_ascii_case(&right_alias) {
+        match constraint {
+            Some(JoinConstraint::On(expr)) => {
+                let mut eq_pairs = Vec::new();
+                collect_eq_pairs(expr, &mut eq_pairs);
+                // Collect ALL composite equality conjuncts matching the same left alias & right_alias
+                let mut chosen_left_alias: Option<String> = None;
+                let mut left_keys: Vec<String> = Vec::new();
+                let mut right_keys: Vec<String> = Vec::new();
+
+                for (l_al, l_col, r_al, r_col) in eq_pairs {
+                    let matched = if r_al.eq_ignore_ascii_case(&right_alias) {
+                        Some((l_al, l_col, r_col))
+                    } else if l_al.eq_ignore_ascii_case(&right_alias) {
+                        Some((r_al, r_col, l_col))
+                    } else {
+                        None
+                    };
+                    if let Some((la, lc, rc)) = matched {
+                        match &chosen_left_alias {
+                            None => {
+                                chosen_left_alias = Some(la);
+                                left_keys.push(lc);
+                                right_keys.push(rc);
+                            }
+                            Some(existing) if existing.eq_ignore_ascii_case(&la) => {
+                                left_keys.push(lc);
+                                right_keys.push(rc);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if let Some(la) = chosen_left_alias {
                     let left_rel = alias_map
                         .iter()
-                        .find(|(a, _)| a.eq_ignore_ascii_case(&l_al))
+                        .find(|(a, _)| a.eq_ignore_ascii_case(&la))
                         .map(|(_, r)| r.clone())
                         .unwrap_or_else(|| base_rel.clone());
                     joins_out.push(ParsedJoin {
                         scope: scope.to_string(),
                         join_type: jtype.to_string(),
+                        is_right,
                         left_relation: left_rel,
-                        left_alias: l_al,
+                        left_alias: la,
                         right_relation: right_rel.clone(),
                         right_alias: right_alias.clone(),
-                        left_key_col: l_col,
-                        right_key_col: r_col,
+                        left_key_cols: left_keys,
+                        right_key_cols: right_keys,
                     });
-                    break;
-                } else if l_al.eq_ignore_ascii_case(&right_alias) {
-                    let left_rel = alias_map
-                        .iter()
-                        .find(|(a, _)| a.eq_ignore_ascii_case(&r_al))
-                        .map(|(_, r)| r.clone())
-                        .unwrap_or_else(|| base_rel.clone());
-                    joins_out.push(ParsedJoin {
-                        scope: scope.to_string(),
-                        join_type: jtype.to_string(),
-                        left_relation: left_rel,
-                        left_alias: r_al,
-                        right_relation: right_rel.clone(),
-                        right_alias: right_alias.clone(),
-                        left_key_col: r_col,
-                        right_key_col: l_col,
-                    });
-                    break;
                 }
             }
+            Some(JoinConstraint::Using(cols)) if !cols.is_empty() => {
+                let key_names: Vec<String> = cols
+                    .iter()
+                    .filter_map(|c| c.0.last().and_then(|p| p.as_ident()).map(|i| i.value.clone()))
+                    .collect();
+                if !key_names.is_empty() {
+                    joins_out.push(ParsedJoin {
+                        scope: scope.to_string(),
+                        join_type: jtype.to_string(),
+                        is_right,
+                        left_relation: base_rel.clone(),
+                        left_alias: base_alias.clone(),
+                        right_relation: right_rel.clone(),
+                        right_alias: right_alias.clone(),
+                        left_key_cols: key_names.clone(),
+                        right_key_cols: key_names,
+                    });
+                }
+            }
+            _ => {}
         }
         alias_map.push((right_alias, right_rel));
     }
@@ -378,27 +566,40 @@ fn extract_qualified_col(expr: &Expr) -> Option<(String, String)> {
     }
 }
 
-fn check_not_in_subquery(scope: &str, expr: &Expr, findings: &mut Vec<Finding>) {
+fn check_not_in_and_subqueries(
+    scope: &str,
+    expr: &Expr,
+    joins_out: &mut Vec<ParsedJoin>,
+    findings: &mut Vec<Finding>,
+) {
     match expr {
         Expr::In {
-            target: InTarget::Subquery(_),
-            negated: true,
+            expr: inner,
+            target: InTarget::Subquery(subq),
+            negated,
             ..
         } => {
-            findings.push(Finding {
-                code: "NOT_IN_NULL_TRAP".to_string(),
-                severity: Severity::Error,
-                location: scope.to_string(),
-                message: "`NOT IN (SELECT ...)` returns 0 rows if the subquery emits even a single NULL.".to_string(),
-                fix_hint: "Rewrite using `NOT EXISTS (SELECT 1 FROM ...)` or filter `IS NOT NULL` inside the subquery.".to_string(),
-            });
+            if *negated {
+                findings.push(Finding {
+                    code: "NOT_IN_NULL_TRAP".to_string(),
+                    severity: Severity::Error,
+                    location: scope.to_string(),
+                    message: "`NOT IN (SELECT ...)` returns 0 rows if the subquery emits even a single NULL.".to_string(),
+                    fix_hint: "Rewrite using `NOT EXISTS (SELECT 1 FROM ...)` or filter `IS NOT NULL` inside the subquery.".to_string(),
+                });
+            }
+            check_not_in_and_subqueries(scope, inner, joins_out, findings);
+            inspect_query(&format!("{scope}.subquery"), subq, joins_out, findings);
+        }
+        Expr::Subquery(subq) | Expr::Exists { subquery: subq, .. } => {
+            inspect_query(&format!("{scope}.subquery"), subq, joins_out, findings);
         }
         Expr::BinaryOp { left, right, .. } => {
-            check_not_in_subquery(scope, left, findings);
-            check_not_in_subquery(scope, right, findings);
+            check_not_in_and_subqueries(scope, left, joins_out, findings);
+            check_not_in_and_subqueries(scope, right, joins_out, findings);
         }
         Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
-            check_not_in_subquery(scope, inner, findings);
+            check_not_in_and_subqueries(scope, inner, joins_out, findings);
         }
         _ => {}
     }
@@ -443,9 +644,18 @@ fn expr_mentions_alias_strictly(expr: &Expr, alias: &str) -> bool {
             collect_expr_aliases(right, &mut aliases);
             aliases.iter().any(|a| a.eq_ignore_ascii_case(alias))
         }
-        Expr::In { expr: inner, .. } => {
+        Expr::In { expr: inner, .. }
+        | Expr::Like { expr: inner, .. }
+        | Expr::ILike { expr: inner, .. }
+        | Expr::Between { expr: inner, .. }
+        | Expr::UnaryOp { expr: inner, .. } => {
             let mut aliases = HashSet::new();
             collect_expr_aliases(inner, &mut aliases);
+            aliases.iter().any(|a| a.eq_ignore_ascii_case(alias))
+        }
+        Expr::CompoundIdentifier(_) | Expr::Function(_) => {
+            let mut aliases = HashSet::new();
+            collect_expr_aliases(expr, &mut aliases);
             aliases.iter().any(|a| a.eq_ignore_ascii_case(alias))
         }
         _ => false,
@@ -463,6 +673,25 @@ fn collect_expr_aliases(expr: &Expr, out: &mut HashSet<String>) {
         Expr::BinaryOp { left, right, .. } => {
             collect_expr_aliases(left, out);
             collect_expr_aliases(right, out);
+        }
+        Expr::Function(func) => {
+            // Skip COALESCE(..., default) since COALESCE can intentionally survive NULLs
+            let fname = func.name.to_string().to_lowercase();
+            if fname == "coalesce" {
+                return;
+            }
+            if let FunctionArguments::List(arg_list) = &func.args {
+                for arg in &arg_list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(e),
+                        ..
+                    } = arg
+                    {
+                        collect_expr_aliases(e, out);
+                    }
+                }
+            }
         }
         _ => {}
     }
