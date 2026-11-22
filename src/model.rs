@@ -111,6 +111,13 @@ impl AuditReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ColumnTypeDiff {
+    pub column: String,
+    pub old_type: String,
+    pub new_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct NumericColDiff {
     pub column: String,
     pub old_sum: Option<f64>,
@@ -144,6 +151,7 @@ pub struct DiffReport {
     pub row_delta: i64,
     pub added_columns: Vec<String>,
     pub removed_columns: Vec<String>,
+    pub type_diffs: Vec<ColumnTypeDiff>,
     pub key_overlap: Option<KeyOverlapDiff>,
     pub numeric_diffs: Vec<NumericColDiff>,
     pub has_drift: bool,

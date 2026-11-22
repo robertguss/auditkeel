@@ -11,8 +11,8 @@ use postgres::{Client, Config, NoTls, Transaction};
 use postgres_native_tls::MakeTlsConnector;
 
 use crate::model::{
-    AuditReport, CteStep, DiffReport, Finding, GrainAudit, JoinProbe, KeyOverlapDiff,
-    NumericColDiff, Severity, SpotCheckTrace, compute_status, sha256_hex,
+    AuditReport, ColumnTypeDiff, CteStep, DiffReport, Finding, GrainAudit, JoinProbe,
+    KeyOverlapDiff, NumericColDiff, Severity, SpotCheckTrace, compute_status, sha256_hex,
 };
 use crate::parse::{self, ParsedJoin, ParsedQuery};
 
@@ -25,15 +25,29 @@ enum RequestedSsl {
     VerifyFull,
 }
 
-fn scrub_dsn_error(msg: String) -> String {
-    // Redact any `://user:password@` credential fragment if echoed in an error
+fn scrub_dsn_error(mut msg: String) -> String {
+    // Redact any `://user:password@` credential fragment (using rfind for `@` in passwords)
+    // and any libpq keyword `password=...` fragment if echoed in an error.
     if let Some(scheme_end) = msg.find("://") {
         let rest = &msg[scheme_end + 3..];
-        if let Some(at_pos) = rest.find('@')
-            && rest[..at_pos].contains(':')
+        let auth_end = rest.find(['/', '?', ' ']).unwrap_or(rest.len());
+        let auth = &rest[..auth_end];
+        if let Some(at_pos) = auth.rfind('@')
+            && auth[..at_pos].contains(':')
         {
-            return format!("{}://***@{}", &msg[..scheme_end], &rest[at_pos + 1..]);
+            msg = format!("{}://***@{}", &msg[..scheme_end], &rest[at_pos + 1..]);
         }
+    }
+    let lower = msg.to_lowercase();
+    if let Some(pw_pos) = lower.find("password=") {
+        let val_start = pw_pos + "password=".len();
+        let tail = &msg[val_start..];
+        let val_len = if let Some(after_q) = tail.strip_prefix('\'') {
+            after_q.find('\'').map(|i| i + 2).unwrap_or(tail.len())
+        } else {
+            tail.find(char::is_whitespace).unwrap_or(tail.len())
+        };
+        msg = format!("{}***{}", &msg[..val_start], &msg[val_start + val_len..]);
     }
     msg
 }
@@ -185,10 +199,15 @@ pub fn run_live_audit(
         let count: i64 = row.get(0);
 
         let parent_count: Option<i64> = cte
-            .referenced_ctes
-            .iter()
-            .filter_map(|r| counts_by_cte.get(r).copied())
-            .max();
+            .primary_from_cte
+            .as_deref()
+            .and_then(|p| counts_by_cte.get(p).copied())
+            .or_else(|| {
+                cte.referenced_ctes
+                    .iter()
+                    .filter_map(|r| counts_by_cte.get(r).copied())
+                    .max()
+            });
         let ratio = parent_count
             .and_then(|p| if p > 0 { Some(count as f64 / p as f64) } else { None });
 
@@ -251,10 +270,16 @@ pub fn run_live_audit(
         .get(0);
 
     let final_parent_count: Option<i64> = parsed
-        .final_referenced_ctes
-        .iter()
-        .filter_map(|r| counts_by_cte.get(r).copied())
-        .max();
+        .final_primary_from_cte
+        .as_deref()
+        .and_then(|p| counts_by_cte.get(p).copied())
+        .or_else(|| {
+            parsed
+                .final_referenced_ctes
+                .iter()
+                .filter_map(|r| counts_by_cte.get(r).copied())
+                .max()
+        });
     let final_ratio = final_parent_count
         .and_then(|p| if p > 0 { Some(final_count as f64 / p as f64) } else { None });
 
@@ -799,11 +824,39 @@ pub fn run_live_diff(
         None
     };
 
-    // Batched numeric column aggregate drift (ONE scan of old_sql + ONE scan of new_sql!)
+    // Shared column type drift detection + batched numeric column aggregate drift
+    let new_type_map: std::collections::HashMap<&str, &str> = new_cols
+        .iter()
+        .map(|(n, ty)| (n.as_str(), ty.as_str()))
+        .collect();
+    let type_diffs: Vec<ColumnTypeDiff> = old_cols
+        .iter()
+        .filter_map(|(c, old_ty)| {
+            new_type_map.get(c.as_str()).and_then(|new_ty| {
+                if old_ty.as_str() != *new_ty {
+                    Some(ColumnTypeDiff {
+                        column: c.clone(),
+                        old_type: old_ty.clone(),
+                        new_type: (*new_ty).to_string(),
+                    })
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    // Only cast/sum columns that are numeric in BOTH old and new queries so a type change
+    // on one column can never poison the batched aggregate query for other numeric columns.
     let numeric_types = ["int2", "int4", "int8", "float4", "float8", "numeric"];
     let common_num_cols: Vec<&str> = old_cols
         .iter()
-        .filter(|(c, ty)| new_set.contains(c.as_str()) && numeric_types.contains(&ty.as_str()))
+        .filter(|(c, old_ty)| {
+            numeric_types.contains(&old_ty.as_str())
+                && new_type_map
+                    .get(c.as_str())
+                    .is_some_and(|new_ty| numeric_types.contains(new_ty))
+        })
         .map(|(c, _)| c.as_str())
         .collect();
 
@@ -821,37 +874,39 @@ pub fn run_live_diff(
             })
             .collect();
         let proj = select_exprs.join(", ");
-        let old_agg = tx.query_one(&format!("SELECT {proj} FROM (\n{old_sql}\n) _a"), &[]);
-        let new_agg = tx.query_one(&format!("SELECT {proj} FROM (\n{new_sql}\n) _b"), &[]);
+        let ro = tx
+            .query_one(&format!("SELECT {proj} FROM (\n{old_sql}\n) _a"), &[])
+            .map_err(|e| format!("failed aggregating numeric columns on old query: {e}"))?;
+        let rn = tx
+            .query_one(&format!("SELECT {proj} FROM (\n{new_sql}\n) _b"), &[])
+            .map_err(|e| format!("failed aggregating numeric columns on new query: {e}"))?;
 
-        if let (Ok(ro), Ok(rn)) = (old_agg, new_agg) {
-            for (idx, col_name) in common_num_cols.iter().enumerate() {
-                let os: Option<f64> = ro.get(idx * 2);
-                let on: i64 = ro.get(idx * 2 + 1);
-                let ns: Option<f64> = rn.get(idx * 2);
-                let nn: i64 = rn.get(idx * 2 + 1);
+        for (idx, col_name) in common_num_cols.iter().enumerate() {
+            let os: Option<f64> = ro.get(idx * 2);
+            let on: i64 = ro.get(idx * 2 + 1);
+            let ns: Option<f64> = rn.get(idx * 2);
+            let nn: i64 = rn.get(idx * 2 + 1);
 
-                let raw_delta = match (os, ns) {
-                    (Some(a), Some(b)) => Some(b - a),
-                    _ => None,
-                };
-                let nan_or_presence_changed = os.map(f64::is_nan) != ns.map(f64::is_nan)
-                    || os.is_some() != ns.is_some();
-                if nan_or_presence_changed
-                    || raw_delta.is_some_and(|v| !v.is_finite() || v.abs() > 1e-6)
-                    || on != nn
-                {
-                    num_drifted = true;
-                }
-                numeric_diffs.push(NumericColDiff {
-                    column: (*col_name).to_string(),
-                    old_sum: os.map(|v| if v.is_finite() { (v * 1000.0).round() / 1000.0 } else { v }),
-                    new_sum: ns.map(|v| if v.is_finite() { (v * 1000.0).round() / 1000.0 } else { v }),
-                    sum_delta: raw_delta.map(|v| if v.is_finite() { (v * 1_000_000.0).round() / 1_000_000.0 } else { v }),
-                    old_nulls: on,
-                    new_nulls: nn,
-                });
+            let raw_delta = match (os, ns) {
+                (Some(a), Some(b)) => Some(b - a),
+                _ => None,
+            };
+            let nan_or_presence_changed = os.map(f64::is_nan) != ns.map(f64::is_nan)
+                || os.is_some() != ns.is_some();
+            if nan_or_presence_changed
+                || raw_delta.is_some_and(|v| !v.is_finite() || v.abs() > 1e-6)
+                || on != nn
+            {
+                num_drifted = true;
             }
+            numeric_diffs.push(NumericColDiff {
+                column: (*col_name).to_string(),
+                old_sum: os.map(|v| if v.is_finite() { (v * 1000.0).round() / 1000.0 } else { v }),
+                new_sum: ns.map(|v| if v.is_finite() { (v * 1000.0).round() / 1000.0 } else { v }),
+                sum_delta: raw_delta.map(|v| if v.is_finite() { (v * 1_000_000.0).round() / 1_000_000.0 } else { v }),
+                old_nulls: on,
+                new_nulls: nn,
+            });
         }
     }
 
@@ -863,6 +918,7 @@ pub fn run_live_diff(
     let has_drift = row_delta != 0
         || !added_columns.is_empty()
         || !removed_columns.is_empty()
+        || !type_diffs.is_empty()
         || key_drifted
         || num_drifted;
 
@@ -879,6 +935,7 @@ pub fn run_live_diff(
         row_delta,
         added_columns,
         removed_columns,
+        type_diffs,
         key_overlap,
         numeric_diffs,
         has_drift,

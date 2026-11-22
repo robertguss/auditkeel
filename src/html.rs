@@ -214,9 +214,22 @@ pub fn render_audit_html(r: &AuditReport, max_fanout: f64) -> String {
 }
 
 pub fn render_diff_html(d: &DiffReport) -> String {
-    let schema_html = if !d.added_columns.is_empty() || !d.removed_columns.is_empty() {
+    let schema_html = if !d.added_columns.is_empty()
+        || !d.removed_columns.is_empty()
+        || !d.type_diffs.is_empty()
+    {
+        let type_part = if d.type_diffs.is_empty() {
+            String::new()
+        } else {
+            let items: Vec<String> = d
+                .type_diffs
+                .iter()
+                .map(|t| format!("{}: {} &rarr; {}", esc(&t.column), esc(&t.old_type), esc(&t.new_type)))
+                .collect();
+            format!(" &middot; Type Changes: <code>{}</code>", items.join(", "))
+        };
         format!(
-            "<div class=\"card\"><h2>Schema Drift</h2><p>Added: <code>{}</code> &middot; Removed: <code>{}</code></p></div>",
+            "<div class=\"card\"><h2>Schema Drift</h2><p>Added: <code>{}</code> &middot; Removed: <code>{}</code>{}</p></div>",
             if d.added_columns.is_empty() {
                 "none".to_string()
             } else {
@@ -226,7 +239,8 @@ pub fn render_diff_html(d: &DiffReport) -> String {
                 "none".to_string()
             } else {
                 esc(&d.removed_columns.join(", "))
-            }
+            },
+            type_part
         )
     } else {
         String::new()

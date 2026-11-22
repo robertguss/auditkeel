@@ -186,6 +186,14 @@ pub fn emit_diff(report: &DiffReport, format: ResolvedFormat) {
                     report.removed_columns.join(", ")
                 );
             }
+            if !report.type_diffs.is_empty() {
+                let td: Vec<String> = report
+                    .type_diffs
+                    .iter()
+                    .map(|t| format!("{} ({} -> {})", t.column, t.old_type, t.new_type))
+                    .collect();
+                println!("  type changes: {}", td.join(", "));
+            }
             if let Some(k) = &report.key_overlap {
                 println!(
                     "  keys ({}): in_both={} | only_in_old={} | only_in_new={}",

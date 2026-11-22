@@ -18,6 +18,7 @@ pub struct ParsedCte {
     pub alias_columns: Vec<String>,
     pub query_sql: String,
     pub referenced_ctes: Vec<String>,
+    pub primary_from_cte: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,7 @@ pub struct ParsedQuery {
     pub with_recursive: bool,
     pub ctes: Vec<ParsedCte>,
     pub final_referenced_ctes: Vec<String>,
+    pub final_primary_from_cte: Option<String>,
     pub full_query_sql: String,
     pub joins: Vec<ParsedJoin>,
     pub static_findings: Vec<Finding>,
@@ -110,12 +112,14 @@ pub fn analyze_sql(raw_sql: &str) -> Result<ParsedQuery, String> {
                 .collect();
             let q_sql = cte.query.to_string();
             let refs = find_referenced_ctes_ast(&cte.query, &known_ctes);
+            let primary_from = find_primary_from_cte(&cte.query, &known_ctes);
             inspect_query(&name, &cte.query, &mut joins, &mut findings);
             ctes.push(ParsedCte {
                 name: name.clone(),
                 alias_columns,
                 query_sql: q_sql,
                 referenced_ctes: refs,
+                primary_from_cte: primary_from,
             });
             known_ctes.push(name);
         }
@@ -125,17 +129,48 @@ pub fn analyze_sql(raw_sql: &str) -> Result<ParsedQuery, String> {
     let mut final_only = query_stmt.clone();
     final_only.with = None;
     let final_referenced_ctes = find_referenced_ctes_ast(&final_only, &known_ctes);
+    let final_primary_from_cte = find_primary_from_cte(&final_only, &known_ctes);
     inspect_query("FINAL", &final_only, &mut joins, &mut findings);
 
     Ok(ParsedQuery {
         with_recursive,
         ctes,
         final_referenced_ctes,
+        final_primary_from_cte,
         // Use AST-serialized single query so multi-statements & trailing comments never break wrapping
         full_query_sql: query_stmt.to_string(),
         joins,
         static_findings: findings,
     })
+}
+
+/// Identify the primary driving `FROM` base CTE (if it is a prior CTE and no `RIGHT`/`FULL` join
+/// overrides driving cardinality) so LEFT JOIN lookup tables do not distort waterfall ratios.
+fn find_primary_from_cte(query: &Query, prior_ctes: &[String]) -> Option<String> {
+    let SetExpr::Select(sel) = query.body.as_ref() else {
+        return None;
+    };
+    let twj = sel.from.first()?;
+    let has_right_or_full = twj.joins.iter().any(|j| {
+        matches!(
+            j.join_operator,
+            JoinOperator::Right(_) | JoinOperator::RightOuter(_) | JoinOperator::FullOuter(_)
+        )
+    });
+    if has_right_or_full {
+        return None;
+    }
+    if let TableFactor::Table { name, .. } = &twj.relation
+        && name.0.len() == 1
+        && let Some(ident) = name.0[0].as_ident()
+    {
+        let low = ident.value.to_lowercase();
+        return prior_ctes
+            .iter()
+            .find(|c| c.to_lowercase() == low)
+            .cloned();
+    }
+    None
 }
 
 fn find_referenced_ctes_ast(query: &Query, prior_ctes: &[String]) -> Vec<String> {
