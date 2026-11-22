@@ -134,7 +134,10 @@ fn check_catches_function_demotion_3way_union_lateral_and_per_table_soft_delete(
 fn help_hides_database_url_env_value() {
     let out = Command::cargo_bin("auditkeel")
         .unwrap()
-        .env("DATABASE_URL", "postgres://secret_user:SUPER_SECRET_PASS@db.internal/prod")
+        .env(
+            "DATABASE_URL",
+            "postgres://secret_user:SUPER_SECRET_PASS@db.internal/prod",
+        )
         .args(["run", "--help"])
         .assert()
         .success()

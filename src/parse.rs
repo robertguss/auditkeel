@@ -165,10 +165,7 @@ fn find_primary_from_cte(query: &Query, prior_ctes: &[String]) -> Option<String>
         && let Some(ident) = name.0[0].as_ident()
     {
         let low = ident.value.to_lowercase();
-        return prior_ctes
-            .iter()
-            .find(|c| c.to_lowercase() == low)
-            .cloned();
+        return prior_ctes.iter().find(|c| c.to_lowercase() == low).cloned();
     }
     None
 }
@@ -540,7 +537,11 @@ fn inspect_table_with_joins(
             Some(JoinConstraint::Using(cols)) if !cols.is_empty() => {
                 let key_names: Vec<String> = cols
                     .iter()
-                    .filter_map(|c| c.0.last().and_then(|p| p.as_ident()).map(|i| i.value.clone()))
+                    .filter_map(|c| {
+                        c.0.last()
+                            .and_then(|p| p.as_ident())
+                            .map(|i| i.value.clone())
+                    })
                     .collect();
                 if !key_names.is_empty() {
                     joins_out.push(ParsedJoin {
@@ -577,10 +578,9 @@ fn collect_eq_pairs(expr: &Expr, out: &mut Vec<(String, String, String, String)>
             op: BinaryOperator::Eq,
             right,
         } => {
-            if let (Some((la, lc)), Some((ra, rc))) = (
-                extract_qualified_col(left),
-                extract_qualified_col(right),
-            ) {
+            if let (Some((la, lc)), Some((ra, rc))) =
+                (extract_qualified_col(left), extract_qualified_col(right))
+            {
                 out.push((la, lc, ra, rc));
             }
         }

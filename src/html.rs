@@ -224,7 +224,14 @@ pub fn render_diff_html(d: &DiffReport) -> String {
             let items: Vec<String> = d
                 .type_diffs
                 .iter()
-                .map(|t| format!("{}: {} &rarr; {}", esc(&t.column), esc(&t.old_type), esc(&t.new_type)))
+                .map(|t| {
+                    format!(
+                        "{}: {} &rarr; {}",
+                        esc(&t.column),
+                        esc(&t.old_type),
+                        esc(&t.new_type)
+                    )
+                })
                 .collect();
             format!(" &middot; Type Changes: <code>{}</code>", items.join(", "))
         };

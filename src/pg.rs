@@ -123,8 +123,9 @@ pub fn connect_postgres(dsn: &str) -> Result<Client, String> {
                 .build()
                 .map_err(|e| format!("TLS initialization failed: {e}"))?;
             let tls = MakeTlsConnector::new(connector);
-            cfg.connect(tls)
-                .map_err(|e| scrub_dsn_error(format!("PostgreSQL TLS (verify-ca) connection failed: {e}")))
+            cfg.connect(tls).map_err(|e| {
+                scrub_dsn_error(format!("PostgreSQL TLS (verify-ca) connection failed: {e}"))
+            })
         }
     }
 }
@@ -153,13 +154,18 @@ fn build_cte_prefix(parsed: &ParsedQuery, up_to_exclusive: usize) -> String {
             let cols = if c.alias_columns.is_empty() {
                 String::new()
             } else {
-                let qcols: Vec<String> = c.alias_columns.iter().map(|col| quote_ident(col)).collect();
+                let qcols: Vec<String> =
+                    c.alias_columns.iter().map(|col| quote_ident(col)).collect();
                 format!("({})", qcols.join(", "))
             };
             format!("{}{cols} AS (\n{}\n)", quote_ident(&c.name), c.query_sql)
         })
         .collect();
-    let rec = if parsed.with_recursive { "RECURSIVE " } else { "" };
+    let rec = if parsed.with_recursive {
+        "RECURSIVE "
+    } else {
+        ""
+    };
     format!("WITH {rec}{}\n", defs.join(",\n"))
 }
 
@@ -191,7 +197,10 @@ pub fn run_live_audit(
     for idx in 0..parsed.ctes.len() {
         let cte = &parsed.ctes[idx];
         let prefix = build_cte_prefix(parsed, idx + 1);
-        let probe_sql = format!("{prefix}SELECT count(*)::bigint FROM {}", quote_ident(&cte.name));
+        let probe_sql = format!(
+            "{prefix}SELECT count(*)::bigint FROM {}",
+            quote_ident(&cte.name)
+        );
         let t0 = Instant::now();
         let row = tx
             .query_one(&probe_sql, &[])
@@ -208,8 +217,13 @@ pub fn run_live_audit(
                     .filter_map(|r| counts_by_cte.get(r).copied())
                     .max()
             });
-        let ratio = parent_count
-            .and_then(|p| if p > 0 { Some(count as f64 / p as f64) } else { None });
+        let ratio = parent_count.and_then(|p| {
+            if p > 0 {
+                Some(count as f64 / p as f64)
+            } else {
+                None
+            }
+        });
 
         if count == 0 && parent_count.unwrap_or(0) > 0 {
             findings.push(Finding {
@@ -280,8 +294,13 @@ pub fn run_live_audit(
                 .filter_map(|r| counts_by_cte.get(r).copied())
                 .max()
         });
-    let final_ratio = final_parent_count
-        .and_then(|p| if p > 0 { Some(final_count as f64 / p as f64) } else { None });
+    let final_ratio = final_parent_count.and_then(|p| {
+        if p > 0 {
+            Some(final_count as f64 / p as f64)
+        } else {
+            None
+        }
+    });
 
     if final_count == 0 && final_parent_count.unwrap_or(0) > 0 {
         findings.push(Finding {
@@ -721,11 +740,17 @@ pub fn run_live_diff(
     configure_readonly_session(&mut tx)?;
 
     let old_cnt: i64 = tx
-        .query_one(&format!("SELECT count(*)::bigint FROM (\n{old_sql}\n) _a"), &[])
+        .query_one(
+            &format!("SELECT count(*)::bigint FROM (\n{old_sql}\n) _a"),
+            &[],
+        )
         .map_err(|e| format!("old query failed: {e}"))?
         .get(0);
     let new_cnt: i64 = tx
-        .query_one(&format!("SELECT count(*)::bigint FROM (\n{new_sql}\n) _b"), &[])
+        .query_one(
+            &format!("SELECT count(*)::bigint FROM (\n{new_sql}\n) _b"),
+            &[],
+        )
         .map_err(|e| format!("new query failed: {e}"))?
         .get(0);
 
@@ -868,9 +893,7 @@ pub fn run_live_diff(
             .iter()
             .map(|c| {
                 let q = quote_ident(c);
-                format!(
-                    "sum(({q})::double precision), count(*) FILTER (WHERE {q} IS NULL)::bigint"
-                )
+                format!("sum(({q})::double precision), count(*) FILTER (WHERE {q} IS NULL)::bigint")
             })
             .collect();
         let proj = select_exprs.join(", ");
@@ -891,8 +914,8 @@ pub fn run_live_diff(
                 (Some(a), Some(b)) => Some(b - a),
                 _ => None,
             };
-            let nan_or_presence_changed = os.map(f64::is_nan) != ns.map(f64::is_nan)
-                || os.is_some() != ns.is_some();
+            let nan_or_presence_changed =
+                os.map(f64::is_nan) != ns.map(f64::is_nan) || os.is_some() != ns.is_some();
             if nan_or_presence_changed
                 || raw_delta.is_some_and(|v| !v.is_finite() || v.abs() > 1e-6)
                 || on != nn
@@ -901,9 +924,27 @@ pub fn run_live_diff(
             }
             numeric_diffs.push(NumericColDiff {
                 column: (*col_name).to_string(),
-                old_sum: os.map(|v| if v.is_finite() { (v * 1000.0).round() / 1000.0 } else { v }),
-                new_sum: ns.map(|v| if v.is_finite() { (v * 1000.0).round() / 1000.0 } else { v }),
-                sum_delta: raw_delta.map(|v| if v.is_finite() { (v * 1_000_000.0).round() / 1_000_000.0 } else { v }),
+                old_sum: os.map(|v| {
+                    if v.is_finite() {
+                        (v * 1000.0).round() / 1000.0
+                    } else {
+                        v
+                    }
+                }),
+                new_sum: ns.map(|v| {
+                    if v.is_finite() {
+                        (v * 1000.0).round() / 1000.0
+                    } else {
+                        v
+                    }
+                }),
+                sum_delta: raw_delta.map(|v| {
+                    if v.is_finite() {
+                        (v * 1_000_000.0).round() / 1_000_000.0
+                    } else {
+                        v
+                    }
+                }),
                 old_nulls: on,
                 new_nulls: nn,
             });
