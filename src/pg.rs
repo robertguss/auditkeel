@@ -131,13 +131,17 @@ pub fn connect_postgres(dsn: &str) -> Result<Client, String> {
     }
 }
 
-fn configure_readonly_session(tx: &mut Transaction<'_>) -> Result<(), String> {
+fn configure_readonly_session(tx: &mut Transaction<'_>, timeout_secs: u64) -> Result<(), String> {
+    let eff_timeout = timeout_secs.max(1);
     tx.execute("SET LOCAL TimeZone = 'UTC'", &[])
         .map_err(|e| format!("failed setting UTC timezone: {e}"))?;
     tx.execute("SET LOCAL lock_timeout = '5s'", &[])
         .map_err(|e| format!("failed setting lock_timeout: {e}"))?;
-    tx.execute("SET LOCAL statement_timeout = '120s'", &[])
-        .map_err(|e| format!("failed setting statement_timeout: {e}"))?;
+    tx.execute(
+        &format!("SET LOCAL statement_timeout = '{eff_timeout}s'"),
+        &[],
+    )
+    .map_err(|e| format!("failed setting statement_timeout: {e}"))?;
     Ok(())
 }
 
@@ -180,6 +184,7 @@ pub fn run_live_audit(
     spot_checks: usize,
     max_fanout: f64,
     min_rows: Option<i64>,
+    timeout_secs: u64,
 ) -> Result<AuditReport, String> {
     let mut client = connect_postgres(dsn)?;
     let mut tx = client
@@ -187,7 +192,7 @@ pub fn run_live_audit(
         .read_only(true)
         .start()
         .map_err(|e| format!("failed to start read-only transaction: {e}"))?;
-    configure_readonly_session(&mut tx)?;
+    configure_readonly_session(&mut tx, timeout_secs)?;
 
     let mut findings = parsed.static_findings.clone();
     let mut waterfall: Vec<CteStep> = Vec::new();
@@ -356,7 +361,7 @@ pub fn run_live_audit(
     // 2. Live Join Cardinality, Composite-Key Fan-Out & Match Coverage Probes
     let mut join_probes: Vec<JoinProbe> = Vec::new();
     for j in &parsed.joins {
-        let probe = probe_join(&mut tx, parsed, j);
+        let probe = probe_join(&mut tx, parsed, j, timeout_secs);
         let lk_label = j.left_key_cols.join(", ");
         let rk_label = j.right_key_cols.join(", ");
         if let Some(fanout) = probe.fanout_factor
@@ -487,7 +492,20 @@ fn any_key_null_expr(alias: &str, keys: &[String]) -> String {
         .join(" OR ")
 }
 
-fn probe_join(tx: &mut Transaction<'_>, parsed: &ParsedQuery, j: &ParsedJoin) -> JoinProbe {
+fn probe_key_expr(alias: &str, keys: &[String]) -> String {
+    if keys.len() == 1 {
+        format!("({alias}.{})::text", quote_ident(&keys[0]))
+    } else {
+        composite_key_expr(alias, keys)
+    }
+}
+
+fn probe_join(
+    tx: &mut Transaction<'_>,
+    parsed: &ParsedQuery,
+    j: &ParsedJoin,
+    timeout_secs: u64,
+) -> JoinProbe {
     let (lrel, rrel, lcols, rcols) = if j.is_right {
         (
             &j.right_relation,
@@ -541,36 +559,66 @@ fn probe_join(tx: &mut Transaction<'_>, parsed: &ParsedQuery, j: &ParsedJoin) ->
     };
     let prefix = build_cte_prefix(parsed, cte_idx);
 
-    let r_kexpr = composite_key_expr("_r", rcols);
+    let l_kexpr = probe_key_expr("_l", lcols);
+    let l_not_null = non_null_all_expr("_l", lcols);
+    let r_kexpr = probe_key_expr("_r", rcols);
     let r_not_null = non_null_all_expr("_r", rcols);
-    let l_kexpr = composite_key_expr("_l", lcols);
-    let join_eq = lcols
-        .iter()
-        .zip(rcols.iter())
-        .map(|(lc, rc)| {
-            format!(
-                "(_l.{})::text = (_r.{})::text",
-                quote_ident(lc),
-                quote_ident(rc)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ");
 
     let Ok(mut sp) = tx.savepoint("auditkeel_join_probe") else {
         base.probe_error = Some("failed to create savepoint".to_string());
         return base;
     };
 
+    let probe_timeout = timeout_secs.clamp(1, 30);
+    let _ = sp.execute(
+        &format!("SET LOCAL statement_timeout = '{probe_timeout}s'"),
+        &[],
+    );
+
+    // Single-pass hash-aggregated probe: scans each side ONCE and computes exact join
+    // cardinality via SUM(l.cnt * r.cnt) without materializing M:N row explosions.
+    let with_clause = if prefix.is_empty() {
+        "WITH ".to_string()
+    } else {
+        format!("{},\n", prefix.trim_end())
+    };
     let stats_sql = format!(
-        "{prefix}SELECT
-          (SELECT count(*)::bigint FROM {lrel} _l) AS l_rows,
-          (SELECT count(*)::bigint FROM {rrel} _r) AS r_rows,
-          (SELECT count(DISTINCT {r_kexpr})::bigint FROM {rrel} _r WHERE {r_not_null}) AS r_dist,
-          coalesce((SELECT max(cnt)::bigint FROM (SELECT count(*) AS cnt FROM {rrel} _r WHERE {r_not_null} GROUP BY {r_kexpr}) _d), 0) AS r_max,
-          coalesce((SELECT count(*)::bigint FROM (SELECT 1 FROM {rrel} _r WHERE {r_not_null} GROUP BY {r_kexpr} HAVING count(*) > 1) _d2), 0) AS r_dup_keys,
-          (SELECT count(*)::bigint FROM {lrel} _l JOIN {rrel} _r ON {join_eq}) AS joined_rows,
-          (SELECT count(*)::bigint FROM {lrel} _l WHERE EXISTS (SELECT 1 FROM {rrel} _r WHERE {join_eq})) AS matched_l"
+        "{with_clause}_ak_l AS (
+          SELECT {l_kexpr} AS _k, ({l_not_null}) AS _nn, count(*)::bigint AS cnt
+          FROM {lrel} _l
+          GROUP BY 1, 2
+        ),
+        _ak_r AS (
+          SELECT {r_kexpr} AS _k, ({r_not_null}) AS _nn, count(*)::bigint AS cnt
+          FROM {rrel} _r
+          GROUP BY 1, 2
+        ),
+        _ak_j AS (
+          SELECT
+            coalesce(sum(l.cnt::numeric * r.cnt::numeric), 0)::bigint AS joined_rows,
+            coalesce(sum(l.cnt), 0)::bigint AS matched_l
+          FROM _ak_l l
+          JOIN _ak_r r ON l._nn AND r._nn AND l._k = r._k
+        )
+        SELECT
+          coalesce((SELECT sum(cnt)::bigint FROM _ak_l), 0) AS l_rows,
+          coalesce((SELECT sum(cnt)::bigint FROM _ak_r), 0) AS r_rows,
+          coalesce((SELECT count(*)::bigint FROM _ak_r WHERE _nn), 0) AS r_dist,
+          coalesce((SELECT max(cnt)::bigint FROM _ak_r WHERE _nn), 0) AS r_max,
+          coalesce((SELECT count(*)::bigint FROM _ak_r WHERE _nn AND cnt > 1), 0) AS r_dup_keys,
+          (SELECT joined_rows FROM _ak_j) AS joined_rows,
+          (SELECT matched_l FROM _ak_j) AS matched_l,
+          coalesce(
+            (SELECT array_agg(k) FROM (
+              SELECT coalesce(l._k, '<NULL>') AS k
+              FROM _ak_l l
+              LEFT JOIN _ak_r r ON r._nn AND r._k = l._k
+              WHERE NOT l._nn OR r._k IS NULL
+              ORDER BY 1
+              LIMIT 3
+            ) _u),
+            ARRAY[]::text[]
+          ) AS sample_unmatched"
     );
 
     match sp.query_one(&stats_sql, &[]) {
@@ -582,6 +630,7 @@ fn probe_join(tx: &mut Transaction<'_>, parsed: &ParsedQuery, j: &ParsedJoin) ->
             let r_dup_keys: i64 = row.get(4);
             let joined_rows: i64 = row.get(5);
             let matched_l: i64 = row.get(6);
+            let sample_unmatched: Vec<String> = row.get(7);
 
             base.left_rows = Some(l_rows);
             base.right_rows = Some(r_rows);
@@ -603,18 +652,8 @@ fn probe_join(tx: &mut Transaction<'_>, parsed: &ParsedQuery, j: &ParsedJoin) ->
             } else {
                 1.0
             });
-
             if l_rows > matched_l {
-                let sample_sql = format!(
-                    "{prefix}SELECT DISTINCT {l_kexpr}
-                    FROM {lrel} _l
-                    WHERE NOT EXISTS (SELECT 1 FROM {rrel} _r WHERE {join_eq})
-                    ORDER BY 1
-                    LIMIT 3"
-                );
-                if let Ok(srows) = sp.query(&sample_sql, &[]) {
-                    base.sample_unmatched_keys = srows.into_iter().map(|r| r.get(0)).collect();
-                }
+                base.sample_unmatched_keys = sample_unmatched;
             }
             let _ = sp.commit();
         }
@@ -726,6 +765,7 @@ pub fn run_live_diff(
     new_source: &str,
     new_sql_raw: &str,
     keys: &[String],
+    timeout_secs: u64,
 ) -> Result<DiffReport, String> {
     let old_parsed = parse::analyze_sql(old_sql_raw)?;
     let new_parsed = parse::analyze_sql(new_sql_raw)?;
@@ -738,7 +778,7 @@ pub fn run_live_diff(
         .read_only(true)
         .start()
         .map_err(|e| format!("failed to start read-only diff transaction: {e}"))?;
-    configure_readonly_session(&mut tx)?;
+    configure_readonly_session(&mut tx, timeout_secs)?;
 
     let old_cnt: i64 = tx
         .query_one(

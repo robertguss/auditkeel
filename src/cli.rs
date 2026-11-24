@@ -84,6 +84,10 @@ pub enum Command {
         #[arg(long, default_value_t = 1.02)]
         max_fanout: f64,
 
+        /// Statement timeout in seconds for read-only PostgreSQL queries (default 30).
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+
         /// Write a self-contained offline Proof-Carrying HTML Audit Receipt.
         #[arg(long)]
         html: Option<PathBuf>,
@@ -130,6 +134,10 @@ pub enum Command {
         /// Entity key column(s), comma-separated, to compute added/dropped keys.
         #[arg(long)]
         key: Option<String>,
+
+        /// Statement timeout in seconds for read-only PostgreSQL queries (default 30).
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
 
         /// Write a self-contained offline HTML Diff Receipt.
         #[arg(long)]

@@ -110,6 +110,7 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
             rules,
             spot_checks,
             max_fanout,
+            timeout_secs,
             html: html_path,
             format,
             fail_on,
@@ -153,6 +154,7 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
                 spot_checks,
                 eff_max_fanout,
                 min_rows,
+                timeout_secs,
             )?;
             if let Some(out_html) = html_path {
                 let rendered = html::render_audit_html(&report, eff_max_fanout);
@@ -174,6 +176,7 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
             new_file,
             dsn,
             key,
+            timeout_secs,
             html: html_path,
             format,
             fail_on_drift,
@@ -198,6 +201,7 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
                 &new_file.display().to_string(),
                 &new_sql,
                 &keys,
+                timeout_secs,
             )?;
             if let Some(out_html) = html_path {
                 let rendered = html::render_diff_html(&diff);
