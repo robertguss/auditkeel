@@ -145,6 +145,21 @@ fn configure_readonly_session(tx: &mut Transaction<'_>, timeout_secs: u64) -> Re
     Ok(())
 }
 
+fn format_pg_err(err: &postgres::Error) -> String {
+    if let Some(db) = err.as_db_error() {
+        let mut msg = format!("{}: {}", db.severity(), db.message());
+        if let Some(detail) = db.detail() {
+            msg.push_str(&format!(" ({detail})"));
+        }
+        if let Some(hint) = db.hint() {
+            msg.push_str(&format!(" [hint: {hint}]"));
+        }
+        msg
+    } else {
+        err.to_string()
+    }
+}
+
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
@@ -210,7 +225,7 @@ pub fn run_live_audit(
         let t0 = Instant::now();
         let row = tx
             .query_one(&probe_sql, &[])
-            .map_err(|e| format!("failed counting CTE `{}`: {e}", cte.name))?;
+            .map_err(|e| format!("failed counting CTE `{}`: {}", cte.name, format_pg_err(&e)))?;
         let count: i64 = row.get(0);
 
         let parent_count: Option<i64> = cte
@@ -286,7 +301,7 @@ pub fn run_live_audit(
     let t_fin = Instant::now();
     let final_count: i64 = tx
         .query_one(&final_sql, &[])
-        .map_err(|e| format!("failed counting final query: {e}"))?
+        .map_err(|e| format!("failed counting final query: {}", format_pg_err(&e)))?
         .get(0);
 
     let final_parent_count: Option<i64> = parsed
@@ -658,7 +673,7 @@ fn probe_join(
             let _ = sp.commit();
         }
         Err(e) => {
-            base.probe_error = Some(format!("join probe skipped: {e}"));
+            base.probe_error = Some(format!("join probe skipped: {}", format_pg_err(&e)));
             let _ = sp.rollback();
         }
     }
@@ -681,9 +696,13 @@ fn audit_grain(
          FROM (\n{}\n) AS _f",
         parsed.full_query_sql
     );
-    let row = tx
-        .query_one(&grain_sql, &[])
-        .map_err(|e| format!("grain check failed on key ({}): {e}", keys.join(", ")))?;
+    let row = tx.query_one(&grain_sql, &[]).map_err(|e| {
+        format!(
+            "grain check failed on key ({}): {}",
+            keys.join(", "),
+            format_pg_err(&e)
+        )
+    })?;
     let total: i64 = row.get(0);
     let distinct: i64 = row.get(1);
     let nulls: i64 = row.get(2);
